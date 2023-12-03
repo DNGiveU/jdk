@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2018, Red Hat, Inc. All rights reserved.
+ * Copyright (c) 2018, 2019, Red Hat, Inc. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License version 2 only, as
@@ -24,27 +25,27 @@
 #ifndef SHARE_GC_SHENANDOAH_HEURISTICS_SHENANDOAHAGGRESSIVEHEURISTICS_HPP
 #define SHARE_GC_SHENANDOAH_HEURISTICS_SHENANDOAHAGGRESSIVEHEURISTICS_HPP
 
-#include "gc/shenandoah/shenandoahHeuristics.hpp"
+#include "gc/shenandoah/heuristics/shenandoahHeuristics.hpp"
 
+/*
+ * This is a diagnostic heuristic that continuously runs collections
+ * cycles and adds every region with any garbage to the collection set.
+ */
 class ShenandoahAggressiveHeuristics : public ShenandoahHeuristics {
 public:
-  ShenandoahAggressiveHeuristics();
+  ShenandoahAggressiveHeuristics(ShenandoahSpaceInfo* space_info);
 
   virtual void choose_collection_set_from_regiondata(ShenandoahCollectionSet* cset,
                                                      RegionData* data, size_t size,
                                                      size_t free);
 
-  virtual bool should_start_gc() const;
-
-  virtual bool should_process_references();
+  virtual bool should_start_gc();
 
   virtual bool should_unload_classes();
 
-  virtual const char* name();
-
-  virtual bool is_diagnostic();
-
-  virtual bool is_experimental();
+  virtual const char* name()     { return "Aggressive"; }
+  virtual bool is_diagnostic()   { return true; }
+  virtual bool is_experimental() { return false; }
 };
 
 #endif // SHARE_GC_SHENANDOAH_HEURISTICS_SHENANDOAHAGGRESSIVEHEURISTICS_HPP

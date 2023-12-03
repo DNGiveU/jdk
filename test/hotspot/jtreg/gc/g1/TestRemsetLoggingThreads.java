@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,13 +27,12 @@ package gc.g1;
  * @test TestRemsetLoggingThreads
  * @requires vm.gc.G1
  * @bug 8025441 8145534
- * @key gc
  * @library /test/lib
  * @modules java.base/jdk.internal.misc
  *          java.management/sun.management
  * @summary Ensure that various values of worker threads/concurrent
  * refinement threads do not crash the VM.
- * @run main gc.g1.TestRemsetLoggingThreads
+ * @run driver gc.g1.TestRemsetLoggingThreads
  */
 
 import java.util.regex.Matcher;
@@ -45,12 +44,12 @@ import jdk.test.lib.process.ProcessTools;
 public class TestRemsetLoggingThreads {
 
   private static void runTest(int refinementThreads, int workerThreads) throws Exception {
-    ProcessBuilder pb = ProcessTools.createJavaProcessBuilder("-XX:+UseG1GC",
-                                                              "-XX:+UnlockDiagnosticVMOptions",
-                                                              "-Xlog:gc+remset+exit=trace",
-                                                              "-XX:G1ConcRefinementThreads=" + refinementThreads,
-                                                              "-XX:ParallelGCThreads=" + workerThreads,
-                                                              "-version");
+    ProcessBuilder pb = ProcessTools.createLimitedTestJavaProcessBuilder("-XX:+UseG1GC",
+                                                                         "-XX:+UnlockDiagnosticVMOptions",
+                                                                         "-Xlog:gc+remset+exit=trace",
+                                                                         "-XX:G1ConcRefinementThreads=" + refinementThreads,
+                                                                         "-XX:ParallelGCThreads=" + workerThreads,
+                                                                         "-version");
 
     OutputAnalyzer output = new OutputAnalyzer(pb.start());
 

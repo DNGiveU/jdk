@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -23,23 +23,21 @@
  */
 
 #include "precompiled.hpp"
-#include "aot/aotLoader.hpp"
 #include "classfile/classLoaderDataGraph.hpp"
 #include "classfile/stringTable.hpp"
-#include "classfile/systemDictionary.hpp"
+#include "gc/shared/oopStorage.inline.hpp"
+#include "gc/shared/oopStorageSet.inline.hpp"
 #include "gc/shared/strongRootsScope.hpp"
 #include "jfr/leakprofiler/chains/bfsClosure.hpp"
 #include "jfr/leakprofiler/chains/dfsClosure.hpp"
 #include "jfr/leakprofiler/chains/edgeQueue.hpp"
 #include "jfr/leakprofiler/chains/rootSetClosure.hpp"
-#include "jfr/leakprofiler/utilities/unifiedOop.hpp"
-#include "memory/universe.hpp"
+#include "jfr/leakprofiler/utilities/unifiedOopRef.inline.hpp"
 #include "oops/access.inline.hpp"
 #include "oops/oop.inline.hpp"
-#include "prims/jvmtiExport.hpp"
-#include "runtime/jniHandles.inline.hpp"
+#include "runtime/javaThread.hpp"
 #include "runtime/synchronizer.hpp"
-#include "runtime/thread.hpp"
+#include "runtime/threads.hpp"
 #include "services/management.hpp"
 #include "utilities/align.hpp"
 
@@ -48,51 +46,60 @@ RootSetClosure<Delegate>::RootSetClosure(Delegate* delegate) : _delegate(delegat
 
 template <typename Delegate>
 void RootSetClosure<Delegate>::do_oop(oop* ref) {
-  assert(ref != NULL, "invariant");
-  // We discard unaligned root references because
-  // our reference tagging scheme will use
-  // the lowest bit in a represented reference
-  // to indicate the reference is narrow.
-  // It is mainly roots delivered via nmethods::do_oops()
-  // that come in unaligned. It should be ok to duck these
-  // since they are supposedly weak.
-  if (!is_aligned(ref, HeapWordSize)) {
-    return;
-  }
-
+  assert(ref != nullptr, "invariant");
   assert(is_aligned(ref, HeapWordSize), "invariant");
-  if (*ref != NULL) {
-    _delegate->do_root(ref);
+  if (NativeAccess<>::oop_load(ref) != nullptr) {
+    _delegate->do_root(UnifiedOopRef::encode_in_native(ref));
   }
 }
 
 template <typename Delegate>
 void RootSetClosure<Delegate>::do_oop(narrowOop* ref) {
-  assert(ref != NULL, "invariant");
+  assert(ref != nullptr, "invariant");
   assert(is_aligned(ref, sizeof(narrowOop)), "invariant");
-  const oop pointee = RawAccess<>::oop_load(ref);
-  if (pointee != NULL) {
-    _delegate->do_root(UnifiedOop::encode(ref));
+  if (!CompressedOops::is_null(*ref)) {
+    _delegate->do_root(UnifiedOopRef::encode_in_native(ref));
   }
 }
 
 class RootSetClosureMarkScope : public MarkScope {};
 
 template <typename Delegate>
+class RawRootClosure : public OopClosure {
+  Delegate* _delegate;
+
+public:
+  RawRootClosure(Delegate* delegate) : _delegate(delegate) {}
+
+  void do_oop(oop* ref) {
+    assert(ref != nullptr, "invariant");
+    assert(is_aligned(ref, HeapWordSize), "invariant");
+    if (*ref != nullptr) {
+      _delegate->do_root(UnifiedOopRef::encode_as_raw(ref));
+    }
+  }
+
+  void do_oop(narrowOop* ref) {
+    assert(ref != nullptr, "invariant");
+    assert(is_aligned(ref, sizeof(narrowOop)), "invariant");
+    if (!CompressedOops::is_null(*ref)) {
+      _delegate->do_root(UnifiedOopRef::encode_as_raw(ref));
+    }
+  }
+};
+
+template <typename Delegate>
 void RootSetClosure<Delegate>::process() {
   RootSetClosureMarkScope mark_scope;
+
   CLDToOopClosure cldt_closure(this, ClassLoaderData::_claim_none);
   ClassLoaderDataGraph::always_strong_cld_do(&cldt_closure);
-  CodeBlobToOopClosure blobs(this, false);
-  Threads::oops_do(this, &blobs);
-  ObjectSynchronizer::oops_do(this);
-  Universe::oops_do(this);
-  JNIHandles::oops_do(this);
-  JvmtiExport::oops_do(this);
-  SystemDictionary::oops_do(this);
-  Management::oops_do(this);
-  StringTable::oops_do(this);
-  AOTLoader::oops_do(this);
+
+  OopStorageSet::strong_oops_do(this);
+
+  // We don't follow code blob oops, because they have misaligned oops.
+  RawRootClosure<Delegate> rrc(_delegate);
+  Threads::oops_do(&rrc, nullptr);
 }
 
 template class RootSetClosure<BFSClosure>;

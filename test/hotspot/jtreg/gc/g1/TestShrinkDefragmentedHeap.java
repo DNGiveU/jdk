@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -37,7 +37,7 @@ package gc.g1;
  * @requires vm.gc.G1
  * @modules java.base/jdk.internal.misc
  *          java.management/sun.management
- * @run main gc.g1.TestShrinkDefragmentedHeap
+ * @run driver gc.g1.TestShrinkDefragmentedHeap
  */
 import java.lang.management.ManagementFactory;
 import java.lang.management.MemoryUsage;
@@ -61,7 +61,7 @@ public class TestShrinkDefragmentedHeap {
     private static final int REGION_SIZE        = 1 * 1024 * 1024;
 
     public static void main(String[] args) throws Exception, Throwable {
-        ProcessBuilder pb = ProcessTools.createJavaProcessBuilder(
+        ProcessBuilder pb = ProcessTools.createLimitedTestJavaProcessBuilder(
                 "-XX:InitialHeapSize=" + INITIAL_HEAP_SIZE,
                 "-Xmn" + MINIMAL_YOUNG_SIZE,
                 "-Xmx" + MAXIMUM_HEAP_SIZE,

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2008, 2020, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,6 +26,7 @@
 #define CPU_ARM_GLOBALDEFINITIONS_ARM_HPP
 
 const int StackAlignmentInBytes = 8;
+const size_t pd_segfault_address = 1024;
 
 // Indicates whether the C calling conventions require that
 // 32-bit integer argument values are extended to 64 bits.
@@ -54,12 +55,5 @@ const bool HaveVFP = true;
 #define ADGLOBALS_MD_HPP       "adfiles/adGlobals_arm_32.hpp"
 #define AD_MD_HPP              "adfiles/ad_arm_32.hpp"
 #define C1_LIRGENERATOR_MD_HPP "c1_LIRGenerator_arm.hpp"
-
-#ifdef TARGET_COMPILER_gcc
-#ifdef ARM32
-#undef BREAKPOINT
-#define BREAKPOINT __asm__ volatile ("bkpt")
-#endif
-#endif
 
 #endif // CPU_ARM_GLOBALDEFINITIONS_ARM_HPP

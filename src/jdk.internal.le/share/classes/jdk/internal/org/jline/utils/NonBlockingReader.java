@@ -85,6 +85,16 @@ public abstract class NonBlockingReader extends Reader {
         return 1;
     }
 
+    public int readBuffered(char[] b) throws IOException {
+        return readBuffered(b, 0L);
+    }
+
+    public int readBuffered(char[] b, long timeout) throws IOException {
+        return readBuffered(b, 0, b.length, timeout);
+    }
+
+    public abstract int readBuffered(char[] b, int off, int len, long timeout) throws IOException;
+
     public int available() {
         return 0;
     }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2023, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2019, SAP. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
@@ -30,7 +30,9 @@
  *           in the error file name)
  * @library /test/lib
  * @modules java.base/jdk.internal.misc
+ * @requires vm.flagless
  * @requires (vm.debug == true)
+ * @run driver ErrorFileOverwriteTest
  */
 
 import jdk.test.lib.process.OutputAnalyzer;
@@ -95,7 +97,7 @@ public class ErrorFileOverwriteTest {
 
     System.out.println("First crash...");
 
-    ProcessBuilder pb = ProcessTools.createJavaProcessBuilder(
+    ProcessBuilder pb = ProcessTools.createLimitedTestJavaProcessBuilder(
             "-Xmx64M",
             "-XX:-CreateCoredumpOnCrash",
             "-XX:ErrorHandlerTest=1",
@@ -121,7 +123,7 @@ public class ErrorFileOverwriteTest {
 
     System.out.println("Second crash...");
 
-    pb = ProcessTools.createJavaProcessBuilder(
+    pb = ProcessTools.createLimitedTestJavaProcessBuilder(
             "-Xmx64M",
             "-XX:-CreateCoredumpOnCrash",
             "-XX:ErrorHandlerTest=2", // << now 2

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,25 +25,33 @@
 
 package jdk.tools.jlink.internal.plugins;
 
-import java.io.*;
-import java.nio.charset.*;
-import java.util.*;
-import java.util.function.*;
-import java.util.stream.*;
-import jdk.tools.jlink.plugin.*;
-import jdk.internal.org.objectweb.asm.*;
+import java.util.Locale;
+import java.util.Map;
+import jdk.internal.classfile.Classfile;
+import jdk.internal.classfile.ClassTransform;
+import jdk.internal.classfile.CodeBuilder;
+import jdk.internal.classfile.CodeElement;
+import jdk.internal.classfile.Instruction;
+import jdk.internal.classfile.instruction.FieldInstruction;
+import jdk.internal.classfile.CodeTransform;
 
-import static java.lang.System.out;
+import jdk.tools.jlink.plugin.ResourcePool;
+import jdk.tools.jlink.plugin.ResourcePoolBuilder;
+import jdk.tools.jlink.plugin.ResourcePoolEntry;
 
 /**
  * Base plugin to update a static field in java.lang.VersionProps
+ *
+ * Fields to be updated must not be final such that values are not constant
+ * replaced at compile time and initialization code is generated.
+ * We assume that the initialization code only has ldcs, method calls and
+ * field instructions.
  */
-abstract class VersionPropsPlugin implements Plugin {
+abstract class VersionPropsPlugin extends AbstractPlugin {
 
     private static final String VERSION_PROPS_CLASS
         = "/java.base/java/lang/VersionProps.class";
 
-    private final String name;
     private final String field;
     private String value;
 
@@ -52,8 +60,8 @@ abstract class VersionPropsPlugin implements Plugin {
      * @param option The option name
      */
     protected VersionPropsPlugin(String field, String option) {
+        super(option);
         this.field = field;
-        this.name = option;
     }
 
     /**
@@ -63,17 +71,7 @@ abstract class VersionPropsPlugin implements Plugin {
      * @param field The name of the java.lang.VersionProps field to be redefined
      */
     protected VersionPropsPlugin(String field) {
-        this(field, field.toLowerCase().replace('_', '-'));
-    }
-
-    @Override
-    public String getName() {
-        return name;
-    }
-
-    @Override
-    public String getDescription() {
-        return PluginsResourceBundle.getDescription(name);
+        this(field, field.toLowerCase(Locale.ROOT).replace('_', '-'));
     }
 
     @Override
@@ -92,13 +90,8 @@ abstract class VersionPropsPlugin implements Plugin {
     }
 
     @Override
-    public String getArgumentsDescription() {
-       return PluginsResourceBundle.getArgument(name);
-    }
-
-    @Override
     public void configure(Map<String, String> config) {
-        var v = config.get(name);
+        var v = config.get(getName());
         if (v == null)
             throw new AssertionError();
         value = v;
@@ -106,55 +99,64 @@ abstract class VersionPropsPlugin implements Plugin {
 
     private boolean redefined = false;
 
-    private byte[] redefine(byte[] classFile) {
+    @SuppressWarnings("deprecation")
+    private byte[] redefine(String path, byte[] classFile) {
+        return Classfile.of().transform(newClassReader(path, classFile),
+            ClassTransform.transformingMethodBodies(
+                mm -> mm.methodName().equalsString("<clinit>"),
+                new CodeTransform() {
+                    private CodeElement pendingLDC = null;
 
-        var cr = new ClassReader(classFile);
-        var cw = new ClassWriter(0);
+                    private void flushPendingLDC(CodeBuilder cob) {
+                        if (pendingLDC != null) {
+                            cob.accept(pendingLDC);
+                            pendingLDC = null;
+                        }
+                    }
 
-        cr.accept(new ClassVisitor(Opcodes.ASM7, cw) {
-
-                public MethodVisitor visitMethod(int access,
-                                                 String name,
-                                                 String desc,
-                                                 String sig,
-                                                 String[] xs)
-                {
-                    if (name.equals("<clinit>"))
-                        return new MethodVisitor(Opcodes.ASM7,
-                                                 super.visitMethod(access,
-                                                                   name,
-                                                                   desc,
-                                                                   sig,
-                                                                   xs))
-                            {
-
-                                public void visitFieldInsn(int opcode,
-                                                           String owner,
-                                                           String name,
-                                                           String desc)
-                                {
-                                    if (opcode == Opcodes.PUTSTATIC
-                                        && name.equals(field))
-                                    {
-                                        // Discard the original value
-                                        super.visitInsn(Opcodes.POP);
-                                        // Load the value that we want
-                                        super.visitLdcInsn(value);
-                                        redefined = true;
-                                    }
-                                    super.visitFieldInsn(opcode, owner,
-                                                         name, desc);
+                    @Override
+                    public void accept(CodeBuilder cob, CodeElement coe) {
+                        if (coe instanceof Instruction ins) {
+                            switch (ins.opcode()) {
+                                case LDC, LDC_W, LDC2_W -> {
+                                    flushPendingLDC(cob);
+                                    pendingLDC = coe;
                                 }
-
-                        };
-                    else
-                        return super.visitMethod(access, name, desc, sig, xs);
-                }
-
-            }, 0);
-
-        return cw.toByteArray();
-
+                                case INVOKEVIRTUAL, INVOKESPECIAL, INVOKESTATIC, INVOKEINTERFACE -> {
+                                    flushPendingLDC(cob);
+                                    cob.accept(coe);
+                                }
+                                case GETSTATIC, GETFIELD, PUTFIELD -> {
+                                    flushPendingLDC(cob);
+                                    cob.accept(coe);
+                                }
+                                case PUTSTATIC -> {
+                                    if (((FieldInstruction)coe).name().equalsString(field)) {
+                                        // assert that there is a pending ldc
+                                        // for the old value
+                                        if (pendingLDC == null) {
+                                            throw new AssertionError("No load " +
+                                                "instruction found for field " + field +
+                                                " in static initializer of " +
+                                                VERSION_PROPS_CLASS);
+                                        }
+                                        // forget about it
+                                        pendingLDC = null;
+                                        // and add an ldc for the new value
+                                        cob.constantInstruction(value);
+                                        redefined = true;
+                                    } else {
+                                        flushPendingLDC(cob);
+                                    }
+                                    cob.accept(coe);
+                                }
+                                default -> cob.accept(coe);
+                            }
+                        } else {
+                            cob.accept(coe);
+                        }
+                    }
+                }));
     }
 
     @Override
@@ -162,7 +164,7 @@ abstract class VersionPropsPlugin implements Plugin {
         in.transformAndCopy(res -> {
                 if (res.type().equals(ResourcePoolEntry.Type.CLASS_OR_RESOURCE)) {
                     if (res.path().equals(VERSION_PROPS_CLASS)) {
-                        return res.copyWithContent(redefine(res.contentBytes()));
+                        return res.copyWithContent(redefine(res.path(), res.contentBytes()));
                     }
                 }
                 return res;
@@ -171,5 +173,4 @@ abstract class VersionPropsPlugin implements Plugin {
             throw new AssertionError(field);
         return out.build();
     }
-
 }

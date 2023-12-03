@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2000, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -46,7 +46,7 @@ import java.io.FileInputStream;
  */
 class KinitOptions {
 
-    // 1. acquire, 2. renew, 3. validate
+    // 0. Help, 1. acquire, 2. renew, 3. validate
     public int action = 1;
 
     // forwardable and proxiable flags have two states:
@@ -143,7 +143,8 @@ class KinitOptions {
                        // -help: legacy.
                        args[i].equalsIgnoreCase("-help")) {
                 printHelp();
-                System.exit(0);
+                action = 0;
+                return;
             } else if (p == null) { // Haven't yet processed a "principal"
                 p = args[i];
                 try {
@@ -193,8 +194,8 @@ class KinitOptions {
             PrincipalName p = cis.readPrincipal(version);
             cis.close();
             if (DEBUG) {
-                System.out.println(">>>KinitOptions principal name from "+
-                                   "the cache is :" + p);
+                System.out.println(">>>KinitOptions principal name from " +
+                                   "the cache is: " + p);
             }
             return p;
         } catch (IOException e) {
@@ -211,7 +212,7 @@ class KinitOptions {
 
         String username = System.getProperty("user.name");
         if (DEBUG) {
-            System.out.println(">>>KinitOptions default username is :"
+            System.out.println(">>>KinitOptions default username is: "
                                + username);
         }
         try {

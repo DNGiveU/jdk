@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -32,6 +32,7 @@ import java.security.PrivilegedActionException;
 import java.security.PrivilegedExceptionAction;
 
 import jdk.jfr.RecordingState;
+import jdk.jfr.internal.util.Utils;
 
 /**
  * Class responsible for dumping recordings on exit
@@ -51,7 +52,7 @@ final class ShutdownHook implements Runnable {
         // starting any "real" operations. In low memory situations,
         // we would like to take an OOM as early as possible.
         tlabDummyObject = new Object();
-
+        recorder.setInShutDown();
         for (PlatformRecording recording : recorder.getRecordings()) {
             if (recording.getDumpOnExit() && recording.getState() == RecordingState.RUNNING) {
                 dump(recording);
@@ -71,13 +72,16 @@ final class ShutdownHook implements Runnable {
                 recording.stop("Dump on exit");
             }
         } catch (Exception e) {
-            Logger.log(LogTag.JFR, LogLevel.DEBUG, () -> "Could not dump recording " + recording.getName() + " on exit.");
+            if (Logger.shouldLog(LogTag.JFR, LogLevel.DEBUG)) {
+                Logger.log(LogTag.JFR, LogLevel.DEBUG, "Could not dump recording " + recording.getName() + " on exit.");
+            }
         }
     }
 
+    @SuppressWarnings("removal")
     private WriteableUserPath makeDumpOnExitPath(PlatformRecording recording) {
         try {
-            String name = Utils.makeFilename(recording.getRecording());
+            String name = JVMSupport.makeFilename(recording.getRecording());
             AccessControlContext acc = recording.getNoDestinationDumpOnExitAccessControlContext();
             return AccessController.doPrivileged(new PrivilegedExceptionAction<WriteableUserPath>() {
                 @Override
@@ -98,8 +102,9 @@ final class ShutdownHook implements Runnable {
     }
 
     static final class ExceptionHandler implements Thread.UncaughtExceptionHandler {
+        @Override
         public void uncaughtException(Thread t, Throwable e) {
-            JVM.getJVM().uncaughtException(t, e);
+            JVM.uncaughtException(t, e);
         }
     }
 }

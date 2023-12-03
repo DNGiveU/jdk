@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -32,10 +32,11 @@ import java.util.function.Consumer;
 import java.util.function.IntConsumer;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
-import jdk.internal.HotSpotIntrinsicCandidate;
 import jdk.internal.util.ArraysSupport;
-import jdk.internal.vm.annotation.ForceInline;
+import jdk.internal.util.DecimalDigits;
 import jdk.internal.vm.annotation.DontInline;
+import jdk.internal.vm.annotation.ForceInline;
+import jdk.internal.vm.annotation.IntrinsicCandidate;
 
 import static java.lang.String.UTF16;
 import static java.lang.String.LATIN1;
@@ -53,7 +54,7 @@ final class StringUTF16 {
         return new byte[len << 1];
     }
 
-    @HotSpotIntrinsicCandidate
+    @IntrinsicCandidate
     // intrinsic performs no bounds checks
     static void putChar(byte[] val, int index, int c) {
         assert index >= 0 && index < length(val) : "Trusted caller missed bounds check";
@@ -62,7 +63,7 @@ final class StringUTF16 {
         val[index]   = (byte)(c >> LO_BYTE_SHIFT);
     }
 
-    @HotSpotIntrinsicCandidate
+    @IntrinsicCandidate
     // intrinsic performs no bounds checks
     static char getChar(byte[] val, int index) {
         assert index >= 0 && index < length(val) : "Trusted caller missed bounds check";
@@ -147,7 +148,7 @@ final class StringUTF16 {
         return dst;
     }
 
-    @HotSpotIntrinsicCandidate
+    @IntrinsicCandidate
     public static byte[] toBytes(char[] value, int off, int len) {
         byte[] val = newBytesFor(len);
         for (int i = 0; i < len; i++) {
@@ -174,7 +175,7 @@ final class StringUTF16 {
     }
 
     // compressedCopy char[] -> byte[]
-    @HotSpotIntrinsicCandidate
+    @IntrinsicCandidate
     public static int compress(char[] src, int srcOff, byte[] dst, int dstOff, int len) {
         for (int i = 0; i < len; i++) {
             char c = src[srcOff];
@@ -190,7 +191,7 @@ final class StringUTF16 {
     }
 
     // compressedCopy byte[] -> byte[]
-    @HotSpotIntrinsicCandidate
+    @IntrinsicCandidate
     public static int compress(byte[] src, int srcOff, byte[] dst, int dstOff, int len) {
         // We need a range check here because 'getChar' has no checks
         checkBoundsOffCount(srcOff, len, src);
@@ -246,8 +247,8 @@ final class StringUTF16 {
         return result;
     }
 
-    @HotSpotIntrinsicCandidate
-    public static void getChars(byte[] value, int srcBegin, int srcEnd, char dst[], int dstBegin) {
+    @IntrinsicCandidate
+    public static void getChars(byte[] value, int srcBegin, int srcEnd, char[] dst, int dstBegin) {
         // We need a range check here because 'getChar' has no checks
         if (srcBegin < srcEnd) {
             checkBoundsOffCount(srcBegin, srcEnd - srcBegin, value);
@@ -258,7 +259,7 @@ final class StringUTF16 {
     }
 
     /* @see java.lang.String.getBytes(int, int, byte[], int) */
-    public static void getBytes(byte[] value, int srcBegin, int srcEnd, byte dst[], int dstBegin) {
+    public static void getBytes(byte[] value, int srcBegin, int srcEnd, byte[] dst, int dstBegin) {
         srcBegin <<= 1;
         srcEnd <<= 1;
         for (int i = srcBegin + (1 >> LO_BYTE_SHIFT); i < srcEnd; i += 2) {
@@ -266,7 +267,7 @@ final class StringUTF16 {
         }
     }
 
-    @HotSpotIntrinsicCandidate
+    @IntrinsicCandidate
     public static boolean equals(byte[] value, byte[] other) {
         if (value.length == other.length) {
             int len = value.length >> 1;
@@ -280,7 +281,7 @@ final class StringUTF16 {
         return false;
     }
 
-    @HotSpotIntrinsicCandidate
+    @IntrinsicCandidate
     public static int compareTo(byte[] value, byte[] other) {
         int len1 = length(value);
         int len2 = length(other);
@@ -309,7 +310,7 @@ final class StringUTF16 {
         return len1 - len2;
     }
 
-    @HotSpotIntrinsicCandidate
+    @IntrinsicCandidate
     public static int compareToLatin1(byte[] value, byte[] other) {
         return -StringLatin1.compareToUTF16(other, value);
     }
@@ -319,25 +320,92 @@ final class StringUTF16 {
     }
 
     public static int compareToCI(byte[] value, byte[] other) {
-        int len1 = length(value);
-        int len2 = length(other);
-        int lim = Math.min(len1, len2);
-        for (int k = 0; k < lim; k++) {
-            char c1 = getChar(value, k);
-            char c2 = getChar(other, k);
-            if (c1 != c2) {
-                c1 = Character.toUpperCase(c1);
-                c2 = Character.toUpperCase(c2);
-                if (c1 != c2) {
-                    c1 = Character.toLowerCase(c1);
-                    c2 = Character.toLowerCase(c2);
-                    if (c1 != c2) {
-                        return c1 - c2;
-                    }
-                }
+        return compareToCIImpl(value, 0, length(value), other, 0, length(other));
+    }
+
+    private static int compareToCIImpl(byte[] value, int toffset, int tlen,
+                                      byte[] other, int ooffset, int olen) {
+        int tlast = toffset + tlen;
+        int olast = ooffset + olen;
+        assert toffset >= 0 && ooffset >= 0;
+        assert tlast <= length(value);
+        assert olast <= length(other);
+
+        for (int k1 = toffset, k2 = ooffset; k1 < tlast && k2 < olast; k1++, k2++) {
+            int cp1 = (int)getChar(value, k1);
+            int cp2 = (int)getChar(other, k2);
+
+            if (cp1 == cp2 || compareCodePointCI(cp1, cp2) == 0) {
+                continue;
+            }
+
+            // Check for supplementary characters case
+            cp1 = codePointIncluding(value, cp1, k1, toffset, tlast);
+            if (cp1 < 0) {
+                k1++;
+                cp1 = -cp1;
+            }
+            cp2 = codePointIncluding(other, cp2, k2, ooffset, olast);
+            if (cp2 < 0) {
+                k2++;
+                cp2 = -cp2;
+            }
+
+            int diff = compareCodePointCI(cp1, cp2);
+            if (diff != 0) {
+                return diff;
             }
         }
-        return len1 - len2;
+        return tlen - olen;
+    }
+
+    // Case insensitive comparison of two code points
+    private static int compareCodePointCI(int cp1, int cp2) {
+        // try converting both characters to uppercase.
+        // If the results match, then the comparison scan should
+        // continue.
+        cp1 = Character.toUpperCase(cp1);
+        cp2 = Character.toUpperCase(cp2);
+        if (cp1 != cp2) {
+            // Unfortunately, conversion to uppercase does not work properly
+            // for the Georgian alphabet, which has strange rules about case
+            // conversion.  So we need to make one last check before
+            // exiting.
+            cp1 = Character.toLowerCase(cp1);
+            cp2 = Character.toLowerCase(cp2);
+            if (cp1 != cp2) {
+                return cp1 - cp2;
+            }
+        }
+        return 0;
+    }
+
+    // Returns a code point from the code unit pointed by "index". If it is
+    // not a surrogate or an unpaired surrogate, then the code unit is
+    // returned as is. Otherwise, it is combined with the code unit before
+    // or after, depending on the type of the surrogate at index, to make a
+    // supplementary code point. The return value will be negated if the code
+    // unit pointed by index is a high surrogate, and index + 1 is a low surrogate.
+    private static int codePointIncluding(byte[] ba, int cp, int index, int start, int end) {
+        // fast check
+        if (!Character.isSurrogate((char)cp)) {
+            return cp;
+        }
+        if (Character.isLowSurrogate((char)cp)) {
+            if (index > start) {
+                char c = getChar(ba, index - 1);
+                if (Character.isHighSurrogate(c)) {
+                    return Character.toCodePoint(c, (char)cp);
+                }
+            }
+        } else if (index + 1 < end) { // cp == high surrogate
+            char c = getChar(ba, index + 1);
+            if (Character.isLowSurrogate(c)) {
+                // negate the code point
+                return - Character.toCodePoint((char)cp, c);
+            }
+        }
+        return cp;
     }
 
     public static int compareToCI_Latin1(byte[] value, byte[] other) {
@@ -345,32 +413,29 @@ final class StringUTF16 {
     }
 
     public static int hashCode(byte[] value) {
-        int h = 0;
-        int length = value.length >> 1;
-        for (int i = 0; i < length; i++) {
-            h = 31 * h + getChar(value, i);
-        }
-        return h;
+        return switch (value.length) {
+            case 0 -> 0;
+            case 2 -> getChar(value, 0);
+            default -> ArraysSupport.vectorizedHashCode(value, 0, value.length >> 1, 0, ArraysSupport.T_CHAR);
+        };
     }
 
-    public static int indexOf(byte[] value, int ch, int fromIndex) {
-        int max = value.length >> 1;
-        if (fromIndex < 0) {
-            fromIndex = 0;
-        } else if (fromIndex >= max) {
-            // Note: fromIndex might be near -1>>>1.
+    public static int indexOf(byte[] value, int ch, int fromIndex, int toIndex) {
+        fromIndex = Math.max(fromIndex, 0);
+        toIndex = Math.min(toIndex, value.length >> 1);
+        if (fromIndex >= toIndex) {
             return -1;
         }
         if (ch < Character.MIN_SUPPLEMENTARY_CODE_POINT) {
             // handle most cases here (ch is a BMP code point or a
             // negative value (invalid code point))
-            return indexOfChar(value, ch, fromIndex, max);
+            return indexOfChar(value, ch, fromIndex, toIndex);
         } else {
-            return indexOfSupplementary(value, ch, fromIndex, max);
+            return indexOfSupplementary(value, ch, fromIndex, toIndex);
         }
     }
 
-    @HotSpotIntrinsicCandidate
+    @IntrinsicCandidate
     public static int indexOf(byte[] value, byte[] str) {
         if (str.length == 0) {
             return 0;
@@ -381,7 +446,7 @@ final class StringUTF16 {
         return indexOfUnsafe(value, length(value), str, length(str), 0);
     }
 
-    @HotSpotIntrinsicCandidate
+    @IntrinsicCandidate
     public static int indexOf(byte[] value, int valueCount, byte[] str, int strCount, int fromIndex) {
         checkBoundsBeginEnd(fromIndex, valueCount, value);
         checkBoundsBeginEnd(0, strCount, str);
@@ -419,7 +484,7 @@ final class StringUTF16 {
     /**
      * Handles indexOf Latin1 substring in UTF16 string.
      */
-    @HotSpotIntrinsicCandidate
+    @IntrinsicCandidate
     public static int indexOfLatin1(byte[] value, byte[] str) {
         if (str.length == 0) {
             return 0;
@@ -430,7 +495,7 @@ final class StringUTF16 {
         return indexOfLatin1Unsafe(value, length(value), str, str.length, 0);
     }
 
-    @HotSpotIntrinsicCandidate
+    @IntrinsicCandidate
     public static int indexOfLatin1(byte[] src, int srcCount, byte[] tgt, int tgtCount, int fromIndex) {
         checkBoundsBeginEnd(fromIndex, srcCount, src);
         String.checkBoundsBeginEnd(0, tgtCount, tgt.length);
@@ -465,7 +530,7 @@ final class StringUTF16 {
         return -1;
     }
 
-    @HotSpotIntrinsicCandidate
+    @IntrinsicCandidate
     private static int indexOfChar(byte[] value, int ch, int fromIndex, int max) {
         checkBoundsBeginEnd(fromIndex, max, value);
         return indexOfCharUnsafe(value, ch, fromIndex, max);
@@ -661,7 +726,7 @@ final class StringUTF16 {
             resultLen = Math.addExact(valLen,
                     Math.multiplyExact(++p, replLen - targLen));
         } catch (ArithmeticException ignored) {
-            throw new OutOfMemoryError();
+           throw new OutOfMemoryError("Required length exceeds implementation limit");
         }
         if (resultLen == 0) {
             return "";
@@ -716,34 +781,7 @@ final class StringUTF16 {
 
     public static boolean regionMatchesCI(byte[] value, int toffset,
                                           byte[] other, int ooffset, int len) {
-        int last = toffset + len;
-        assert toffset >= 0 && ooffset >= 0;
-        assert ooffset + len <= length(other);
-        assert last <= length(value);
-        while (toffset < last) {
-            char c1 = getChar(value, toffset++);
-            char c2 = getChar(other, ooffset++);
-            if (c1 == c2) {
-                continue;
-            }
-            // try converting both characters to uppercase.
-            // If the results match, then the comparison scan should
-            // continue.
-            char u1 = Character.toUpperCase(c1);
-            char u2 = Character.toUpperCase(c2);
-            if (u1 == u2) {
-                continue;
-            }
-            // Unfortunately, conversion to uppercase does not work properly
-            // for the Georgian alphabet, which has strange rules about case
-            // conversion.  So we need to make one last check before
-            // exiting.
-            if (Character.toLowerCase(u1) == Character.toLowerCase(u2)) {
-                continue;
-            }
-            return false;
-        }
-        return true;
+        return compareToCIImpl(value, toffset, len, other, ooffset, len) == 0;
     }
 
     public static boolean regionMatchesCI_Latin1(byte[] value, int toffset,
@@ -1016,22 +1054,16 @@ final class StringUTF16 {
     public static String stripLeading(byte[] value) {
         int length = value.length >>> 1;
         int left = indexOfNonWhitespace(value);
-        if (left == length) {
-            return "";
-        }
         return (left != 0) ? newString(value, left, length - left) : null;
     }
 
     public static String stripTrailing(byte[] value) {
         int length = value.length >>> 1;
         int right = lastIndexOfNonWhitespace(value);
-        if (right == 0) {
-            return "";
-        }
         return (right != length) ? newString(value, 0, right) : null;
     }
 
-    private final static class LinesSpliterator implements Spliterator<String> {
+    private static final class LinesSpliterator implements Spliterator<String> {
         private byte[] value;
         private int index;        // current index, modified on advance/split
         private final int fence;  // one past last index
@@ -1132,6 +1164,9 @@ final class StringUTF16 {
     }
 
     public static String newString(byte[] val, int index, int len) {
+        if (len == 0) {
+            return "";
+        }
         if (String.COMPACT_STRINGS) {
             byte[] buf = compress(val, index, len);
             if (buf != null) {
@@ -1485,7 +1520,7 @@ final class StringUTF16 {
     // been done by the caller.
 
     /**
-     * This is a variant of {@link Integer#getChars(int, int, byte[])}, but for
+     * This is a variant of {@link StringLatin1#getChars(int, int, byte[])}, but for
      * UTF-16 coder.
      *
      * @param i     value to convert
@@ -1494,6 +1529,7 @@ final class StringUTF16 {
      * @return index of the most significant digit or minus sign, if present
      */
     static int getChars(int i, int index, byte[] buf) {
+        // Used by trusted callers.  Assumes all necessary bounds checks have been done by the caller.
         int q, r;
         int charPos = index;
 
@@ -1507,18 +1543,16 @@ final class StringUTF16 {
             q = i / 100;
             r = (q * 100) - i;
             i = q;
-            putChar(buf, --charPos, Integer.DigitOnes[r]);
-            putChar(buf, --charPos, Integer.DigitTens[r]);
+            charPos -= 2;
+            putPair(buf, charPos, r);
         }
 
         // We know there are at most two digits left at this point.
-        q = i / 10;
-        r = (q * 10) - i;
-        putChar(buf, --charPos, '0' + r);
-
-        // Whatever left is the remaining digit.
-        if (q < 0) {
-            putChar(buf, --charPos, '0' - q);
+        if (i < -9) {
+            charPos -= 2;
+            putPair(buf, charPos, -i);
+        } else {
+            putChar(buf, --charPos, '0' - i);
         }
 
         if (negative) {
@@ -1528,7 +1562,7 @@ final class StringUTF16 {
     }
 
     /**
-     * This is a variant of {@link Long#getChars(long, int, byte[])}, but for
+     * This is a variant of {@link StringLatin1#getChars(long, int, byte[])}, but for
      * UTF-16 coder.
      *
      * @param i     value to convert
@@ -1537,8 +1571,8 @@ final class StringUTF16 {
      * @return index of the most significant digit or minus sign, if present
      */
     static int getChars(long i, int index, byte[] buf) {
+        // Used by trusted callers.  Assumes all necessary bounds checks have been done by the caller.
         long q;
-        int r;
         int charPos = index;
 
         boolean negative = (i < 0);
@@ -1549,10 +1583,9 @@ final class StringUTF16 {
         // Get 2 digits/iteration using longs until quotient fits into an int
         while (i <= Integer.MIN_VALUE) {
             q = i / 100;
-            r = (int)((q * 100) - i);
+            charPos -= 2;
+            putPair(buf, charPos, (int)((q * 100) - i));
             i = q;
-            putChar(buf, --charPos, Integer.DigitOnes[r]);
-            putChar(buf, --charPos, Integer.DigitTens[r]);
         }
 
         // Get 2 digits/iteration using ints
@@ -1560,26 +1593,29 @@ final class StringUTF16 {
         int i2 = (int)i;
         while (i2 <= -100) {
             q2 = i2 / 100;
-            r  = (q2 * 100) - i2;
+            charPos -= 2;
+            putPair(buf, charPos, (q2 * 100) - i2);
             i2 = q2;
-            putChar(buf, --charPos, Integer.DigitOnes[r]);
-            putChar(buf, --charPos, Integer.DigitTens[r]);
         }
 
         // We know there are at most two digits left at this point.
-        q2 = i2 / 10;
-        r  = (q2 * 10) - i2;
-        putChar(buf, --charPos, '0' + r);
-
-        // Whatever left is the remaining digit.
-        if (q2 < 0) {
-            putChar(buf, --charPos, '0' - q2);
+        if (i2 < -9) {
+            charPos -= 2;
+            putPair(buf, charPos, -i2);
+        } else {
+            putChar(buf, --charPos, '0' - i2);
         }
 
         if (negative) {
             putChar(buf, --charPos, '-');
         }
         return charPos;
+    }
+
+    private static void putPair(byte[] buf, int charPos, int v) {
+        int packed = (int) DecimalDigits.digitPair(v);
+        putChar(buf, charPos, packed & 0xFF);
+        putChar(buf, charPos + 1, packed >> 8);
     }
     // End of trusted methods.
 

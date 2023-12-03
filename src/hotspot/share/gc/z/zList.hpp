@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2020, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,6 +25,7 @@
 #define SHARE_GC_Z_ZLIST_HPP
 
 #include "memory/allocation.hpp"
+#include "utilities/globalDefinitions.hpp"
 
 template <typename T> class ZList;
 
@@ -34,18 +35,18 @@ class ZListNode {
   friend class ZList<T>;
 
 private:
-  ZListNode* _next;
-  ZListNode* _prev;
+  ZListNode<T>* _next;
+  ZListNode<T>* _prev;
 
-  ZListNode(ZListNode* next, ZListNode* prev);
+  NONCOPYABLE(ZListNode);
 
-  void set_unused();
+  void verify_links() const;
+  void verify_links_linked() const;
+  void verify_links_unlinked() const;
 
 public:
   ZListNode();
   ~ZListNode();
-
-  bool is_unused() const;
 };
 
 // Doubly linked list
@@ -55,11 +56,9 @@ private:
   ZListNode<T> _head;
   size_t       _size;
 
-  // Passing by value and assignment is not allowed
-  ZList(const ZList<T>& list);
-  ZList<T>& operator=(const ZList<T>& list);
+  NONCOPYABLE(ZList);
 
-  void verify() const;
+  void verify_head() const;
 
   void insert(ZListNode<T>* before, ZListNode<T>* node);
 
@@ -85,11 +84,9 @@ public:
   void remove(T* elem);
   T* remove_first();
   T* remove_last();
-
-  void transfer(ZList<T>* list);
 };
 
-template <typename T, bool forward>
+template <typename T, bool Forward>
 class ZListIteratorImpl : public StackObj {
 private:
   const ZList<T>* const _list;
@@ -101,20 +98,19 @@ public:
   bool next(T** elem);
 };
 
-// Iterator types
-#define ZLIST_FORWARD        true
-#define ZLIST_REVERSE        false
+template <typename T, bool Forward>
+class ZListRemoveIteratorImpl : public StackObj {
+private:
+  ZList<T>* const _list;
 
-template <typename T>
-class ZListIterator : public ZListIteratorImpl<T, ZLIST_FORWARD> {
 public:
-  ZListIterator(const ZList<T>* list);
+  ZListRemoveIteratorImpl(ZList<T>* list);
+
+  bool next(T** elem);
 };
 
-template <typename T>
-class ZListReverseIterator : public ZListIteratorImpl<T, ZLIST_REVERSE> {
-public:
-  ZListReverseIterator(const ZList<T>* list);
-};
+template <typename T> using ZListIterator = ZListIteratorImpl<T, true /* Forward */>;
+template <typename T> using ZListReverseIterator = ZListIteratorImpl<T, false /* Forward */>;
+template <typename T> using ZListRemoveIterator = ZListRemoveIteratorImpl<T, true /* Forward */>;
 
 #endif // SHARE_GC_Z_ZLIST_HPP

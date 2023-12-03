@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -41,13 +41,18 @@ import tests.Result;
 /*
  * @test
  * @bug 8152143 8152704 8155649 8165804 8185841 8176841 8190918
- *      8179071 8202537 8221432
+ *      8179071 8202537 8221432 8222098 8251317 8258794 8265315
+ *      8296248 8306116
  * @summary IncludeLocalesPlugin tests
  * @author Naoto Sato
  * @requires (vm.compMode != "Xcomp" & os.maxMemory >= 2g)
  * @library ../../lib
  * @modules java.base/jdk.internal.jimage
- *          jdk.jdeps/com.sun.tools.classfile
+ *          java.base/jdk.internal.classfile
+ *          java.base/jdk.internal.classfile.attribute
+ *          java.base/jdk.internal.classfile.constantpool
+ *          java.base/jdk.internal.classfile.instruction
+ *          java.base/jdk.internal.classfile.components
  *          jdk.jlink/jdk.tools.jlink.internal
  *          jdk.jlink/jdk.tools.jlink.internal.plugins
  *          jdk.jlink/jdk.tools.jlink.plugin
@@ -56,7 +61,7 @@ import tests.Result;
  *          jdk.compiler
  * @build tests.*
  * @build tools.jlink.plugins.GetAvailableLocales
- * @run main/othervm -Xmx1g IncludeLocalesPluginTest
+ * @run main/othervm/timeout=180 -Xmx1g IncludeLocalesPluginTest
  */
 public class IncludeLocalesPluginTest {
 
@@ -146,22 +151,26 @@ public class IncludeLocalesPluginTest {
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_ja.class",
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_th.class"),
             List.of(
-                "(root)", "en", "en_US", "en_US_POSIX", "en_001", "en_150", "en_AG", "en_AI",
+                "(root)", "en", "en_001", "en_150", "en_AG", "en_AI",
                 "en_AT", "en_AU", "en_BB", "en_BE", "en_BM", "en_BS", "en_BW", "en_BZ",
-                "en_CA", "en_CC", "en_CH", "en_CK", "en_CM", "en_CX", "en_CY", "en_DE",
+                "en_CC", "en_CH", "en_CK", "en_CM", "en_CX", "en_CY", "en_DE",
                 "en_DG", "en_DK", "en_DM", "en_ER", "en_FI", "en_FJ", "en_FK", "en_FM",
-                "en_GB", "en_GD", "en_GG", "en_GH", "en_GI", "en_GM", "en_GY", "en_HK",
+                "en_GB", "en_GD", "en_GG", "en_GH", "en_GI", "en_GM", "en_GY", "en_HK", "en_ID",
                 "en_IE", "en_IL", "en_IM", "en_IN", "en_IO", "en_JE", "en_JM", "en_KE",
                 "en_KI", "en_KN", "en_KY", "en_LC", "en_LR", "en_LS", "en_MG", "en_MO",
-                "en_MS", "en_MT", "en_MU", "en_MW", "en_MY", "en_NA", "en_NF", "en_NG",
-                "en_NL", "en_NR", "en_NU", "en_NZ", "en_PG", "en_PH", "en_PK", "en_PN",
+                "en_MS", "en_MT", "en_MU", "en_MV", "en_MW", "en_MY", "en_NA", "en_NF", "en_NG",
+                "en_NL", "en_NR", "en_NU", "en_NZ", "en_PG", "en_PK", "en_PN",
                 "en_PW", "en_RW", "en_SB", "en_SC", "en_SD", "en_SE", "en_SG", "en_SH",
                 "en_SI", "en_SL", "en_SS", "en_SX", "en_SZ", "en_TC", "en_TK", "en_TO",
-                "en_TT", "en_TV", "en_TZ", "en_UG", "en_VC", "en_VG", "en_VU", "en_WS",
+                "en_TT", "en_TV", "en_TZ", "en_UG", "en_US", "en_US_#Latn", "en_US_POSIX", "en_VC", "en_VG", "en_VU", "en_WS",
                 "en_ZA", "en_ZM", "en_ZW", "es", "es_419", "es_AR", "es_BO", "es_BR", "es_BZ",
                 "es_CL", "es_CO", "es_CR", "es_CU", "es_DO", "es_EC", "es_GT", "es_HN",
                 "es_MX", "es_NI", "es_PA", "es_PE", "es_PR", "es_PY", "es_SV", "es_US",
-                "es_UY", "es_VE"),
+                "es_UY", "es_VE",
+                // CLDR's "hi-Latn" falls back to "en-001", "hi-Latn"/"hi-Latn-IN" are added
+                // here. Since Locale.Matcher cannot handle such exceptional inheritance,
+                // allowing to include "hi"/"hi-IN" resource files.
+                "hi", "hi__#Latn", "hi_IN", "hi_IN_#Latn"),
             "",
         },
 
@@ -189,15 +198,15 @@ public class IncludeLocalesPluginTest {
                 "en_CA", "en_CC", "en_CH", "en_CK", "en_CM", "en_CX", "en_CY", "en_DE",
                 "en_DG", "en_DK", "en_DM", "en_ER", "en_FI", "en_FJ", "en_FK", "en_FM",
                 "en_GB", "en_GD", "en_GG", "en_GH", "en_GI", "en_GM", "en_GU", "en_GY",
-                "en_HK", "en_IE", "en_IL", "en_IM", "en_IN", "en_IO", "en_JE", "en_JM",
+                "en_HK", "en_ID", "en_IE", "en_IL", "en_IM", "en_IN", "en_IO", "en_JE", "en_JM",
                 "en_KE", "en_KI", "en_KN", "en_KY", "en_LC", "en_LR", "en_LS", "en_MG",
-                "en_MH", "en_MO", "en_MP", "en_MS", "en_MT", "en_MU", "en_MW", "en_MY",
+                "en_MH", "en_MO", "en_MP", "en_MS", "en_MT", "en_MU", "en_MV", "en_MW", "en_MY",
                 "en_NA", "en_NF", "en_NG", "en_NL", "en_NR", "en_NU", "en_NZ", "en_PG",
                 "en_PH", "en_PK", "en_PN", "en_PR", "en_PW", "en_RW", "en_SB", "en_SC",
                 "en_SD", "en_SE", "en_SG", "en_SH", "en_SI", "en_SL", "en_SS", "en_SX",
                 "en_SZ", "en_TC", "en_TK", "en_TO", "en_TT", "en_TV", "en_TZ", "en_UG",
-                "en_UM", "en_US", "en_US_POSIX", "en_VC", "en_VG", "en_VI", "en_VU",
-                "en_WS", "en_ZA", "en_ZM", "en_ZW", "ja", "ja_JP",
+                "en_UM", "en_US", "en_US_#Latn", "en_US_POSIX", "en_VC", "en_VG", "en_VI", "en_VU",
+                "en_WS", "en_ZA", "en_ZM", "en_ZW", "ja", "ja_JP", "ja_JP_#Jpan",
                 "ja_JP_JP_#u-ca-japanese"),
             "",
         },
@@ -225,7 +234,7 @@ public class IncludeLocalesPluginTest {
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_ja.class",
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_th.class"),
             List.of(
-                "(root)", "en", "en_US", "en_US_POSIX", "en_001", "en_150", "en_AT",
+                "(root)", "en", "en_001", "en_150", "en_AT", "en_US", "en_US_#Latn", "en_US_POSIX",
                 "de", "de_AT"),
             "",
         },
@@ -254,11 +263,18 @@ public class IncludeLocalesPluginTest {
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_th.class",
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_zh.class"),
             List.of(
-                "(root)", "as_IN", "as", "bn_IN", "bn", "bo_IN", "bo", "brx_IN", "brx",
-                "ccp", "ccp_IN","en", "en_001", "en_IN", "en_US", "en_US_POSIX", "gu_IN",
-                "gu", "hi_IN", "hi", "kn_IN", "kn", "kok_IN", "kok", "ks_IN", "ks", "ml_IN",
-                "ml", "mr_IN", "mr", "ne_IN", "ne", "or_IN", "or", "pa", "pa_IN_#Guru",
-                "pa__#Guru", "ta_IN", "ta", "te_IN", "te", "ur_IN", "ur"),
+                "(root)", "as", "as_IN", "as_IN_#Beng", "bgc", "bgc_IN", "bgc_IN_#Deva", "bho", "bho_IN", "bho_IN_#Deva",
+                "bn", "bn_IN", "bo", "bo_IN", "brx", "brx_IN", "brx_IN_#Deva", "ccp", "ccp_IN", "doi", "doi_IN",
+                "doi_IN_#Deva", "en", "en_001", "en_IN", "en_US", "en_US_#Latn", "en_US_POSIX", "gu", "gu_IN",
+                "gu_IN_#Gujr", "hi", "hi__#Latn", "hi_IN", "hi_IN_#Deva", "hi_IN_#Latn", "kn", "kn_IN", "kn_IN_#Knda",
+                "kok", "kok_IN", "kok_IN_#Deva", "ks", "ks__#Arab", "ks__#Deva", "ks_IN", "ks_IN_#Arab", "ks_IN_#Deva",
+                "kxv", "kxv_IN", "kxv_IN_#Deva", "kxv_IN_#Latn", "kxv_IN_#Orya", "kxv_IN_#Telu",
+                "kxv__#Deva", "kxv__#Latn", "kxv__#Orya", "kxv__#Telu",
+                "mai", "mai_IN", "mai_IN_#Deva", "mni", "mni__#Beng", "mni_IN", "mni_IN_#Beng", "ml", "ml_IN",
+                "ml_IN_#Mlym", "mr", "mr_IN", "mr_IN_#Deva", "ne", "ne_IN", "or", "or_IN", "or_IN_#Orya", "pa",
+                "pa__#Guru", "pa_IN", "pa_IN_#Guru", "raj", "raj_IN", "raj_IN_#Deva", "sa", "sa_IN", "sa_IN_#Deva",
+                "sat", "sat__#Olck", "sat_IN", "sat_IN_#Olck", "sd", "sd__#Deva", "sd_IN", "sd_IN_#Deva", "ta", "ta_IN",
+                "ta_IN_#Taml", "te", "te_IN", "te_IN_#Telu", "ur_IN", "ur", "xnr", "xnr_IN", "xnr_IN_#Deva"),
             "",
         },
 
@@ -281,8 +297,8 @@ public class IncludeLocalesPluginTest {
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_ja.class",
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_zh.class"),
             List.of(
-                "(root)", "en", "en_US", "en_US_POSIX", "th", "th_TH",
-                "th_TH_TH_#u-nu-thai"),
+                "(root)", "en", "en_US", "en_US_#Latn", "en_US_POSIX", "th", "th_TH",
+                "th_TH_#Thai", "th_TH_TH_#u-nu-thai"),
             "",
         },
 
@@ -308,7 +324,7 @@ public class IncludeLocalesPluginTest {
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_ja.class",
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_th.class"),
             List.of(
-                "(root)", "en", "en_US", "en_US_POSIX", "zh", "zh__#Hans", "zh__#Hant",
+                "(root)", "en", "en_US", "en_US_#Latn", "en_US_POSIX", "zh", "zh__#Hans", "zh__#Hant",
                 "zh_HK", "zh_HK_#Hans", "zh_HK_#Hant"),
             "",
         },
@@ -334,8 +350,8 @@ public class IncludeLocalesPluginTest {
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_ja.class",
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_th.class"),
             List.of(
-                "(root)", "en", "en_US", "en_US_POSIX", "zh", "zh__#Hans", "zh_CN",
-                "zh_CN_#Hans", "zh_HK_#Hans", "zh_MO_#Hans", "zh_SG", "zh_SG_#Hans"),
+                "(root)", "en", "en_US", "en_US_#Latn", "en_US_POSIX", "zh", "zh__#Hans", "zh_CN",
+                "zh_CN_#Hans", "zh_HK", "zh_HK_#Hans", "zh_MO", "zh_MO_#Hans", "zh_SG", "zh_SG_#Hans"),
             "",
         },
 
@@ -348,7 +364,8 @@ public class IncludeLocalesPluginTest {
                 "/jdk.localedata/sun/text/resources/ext/FormatData_no_NO.class",
                 "/jdk.localedata/sun/text/resources/ext/FormatData_no_NO_NY.class",
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_nb.class",
-                "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_nn.class"),
+                "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_nn.class",
+                "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_no.class"),
             List.of(
                 "/jdk.localedata/sun/text/resources/ext/LineBreakIteratorData_th",
                 "/jdk.localedata/sun/text/resources/ext/thai_dict",
@@ -361,8 +378,9 @@ public class IncludeLocalesPluginTest {
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_ja.class",
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_th.class"),
             List.of(
-                "(root)", "en", "en_US", "en_US_POSIX", "nb", "nb_NO", "nb_SJ", "nn",
-                "nn_NO", "no", "no_NO", "no_NO_NY"),
+                "(root)", "en", "en_US", "en_US_#Latn", "en_US_POSIX", "nb", "nb_NO",
+                "nb_NO_#Latn", "nb_SJ", "nn", "nn_NO", "nn_NO_#Latn", "no", "no_NO", "no_NO_NY",
+                "no_NO_#Latn"),
             "",
         },
 
@@ -371,13 +389,13 @@ public class IncludeLocalesPluginTest {
             "--include-locales=he,id,yi",
             "jdk.localedata",
             List.of(
-                "/jdk.localedata/sun/text/resources/ext/FormatData_in.class",
-                "/jdk.localedata/sun/text/resources/ext/FormatData_in_ID.class",
-                "/jdk.localedata/sun/text/resources/ext/FormatData_iw.class",
-                "/jdk.localedata/sun/text/resources/ext/FormatData_iw_IL.class",
-                "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_in.class",
-                "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_iw.class",
-                "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_ji.class"),
+                "/jdk.localedata/sun/text/resources/ext/FormatData_he.class",
+                "/jdk.localedata/sun/text/resources/ext/FormatData_he_IL.class",
+                "/jdk.localedata/sun/text/resources/ext/FormatData_id.class",
+                "/jdk.localedata/sun/text/resources/ext/FormatData_id_ID.class",
+                "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_he.class",
+                "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_id.class",
+                "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_yi.class"),
             List.of(
                 "/jdk.localedata/sun/text/resources/ext/LineBreakIteratorData_th",
                 "/jdk.localedata/sun/text/resources/ext/thai_dict",
@@ -390,8 +408,8 @@ public class IncludeLocalesPluginTest {
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_ja.class",
                 "/jdk.localedata/sun/text/resources/cldr/ext/FormatData_th.class"),
             List.of(
-                "(root)", "en", "en_US", "en_US_POSIX", "in", "in_ID", "iw", "iw_IL",
-                "ji", "ji_001"),
+                "(root)", "en", "en_US", "en_US_#Latn", "en_US_POSIX", "id", "id_ID",
+                "id_ID_#Latn", "he", "he_IL", "he_IL_#Hebr", "yi", "yi_UA", "yi_UA_#Hebr"),
             "",
         },
 
@@ -411,14 +429,14 @@ public class IncludeLocalesPluginTest {
                 "en_CA", "en_CC", "en_CH", "en_CK", "en_CM", "en_CX", "en_CY", "en_DE",
                 "en_DG", "en_DK", "en_DM", "en_ER", "en_FI", "en_FJ", "en_FK", "en_FM",
                 "en_GB", "en_GD", "en_GG", "en_GH", "en_GI", "en_GM", "en_GU", "en_GY",
-                "en_HK", "en_IE", "en_IL", "en_IM", "en_IN", "en_IO", "en_JE", "en_JM",
+                "en_HK", "en_ID", "en_IE", "en_IL", "en_IM", "en_IN", "en_IO", "en_JE", "en_JM",
                 "en_KE", "en_KI", "en_KN", "en_KY", "en_LC", "en_LR", "en_LS", "en_MG",
-                "en_MH", "en_MO", "en_MP", "en_MS", "en_MT", "en_MU", "en_MW", "en_MY",
+                "en_MH", "en_MO", "en_MP", "en_MS", "en_MT", "en_MU", "en_MV", "en_MW", "en_MY",
                 "en_NA", "en_NF", "en_NG", "en_NL", "en_NR", "en_NU", "en_NZ", "en_PG",
                 "en_PH", "en_PK", "en_PN", "en_PR", "en_PW", "en_RW", "en_SB", "en_SC",
                 "en_SD", "en_SE", "en_SG", "en_SH", "en_SI", "en_SL", "en_SS", "en_SX",
                 "en_SZ", "en_TC", "en_TK", "en_TO", "en_TT", "en_TV", "en_TZ", "en_UG",
-                "en_UM", "en_US", "en_US_POSIX", "en_VC", "en_VG", "en_VI", "en_VU",
+                "en_UM", "en_US", "en_US_#Latn", "en_US_POSIX", "en_VC", "en_VG", "en_VI", "en_VU",
                 "en_WS", "en_ZA", "en_ZM", "en_ZW"),
             "",
         },

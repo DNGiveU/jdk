@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -50,10 +50,20 @@
  *
  * https://developers.redhat.com/blog/2016/12/05/configuring-and-using-persistent-memory-rhel-7-3/
  * https://nvdimm.wiki.kernel.org/
- * TL;DR: add "memmap=1G!4G" to /etc/default/grub,
- *        then grub2-mkconfig -o /boot/grub2/grub.cfg and reboot
+ * TL;DR: add "memmap=1G!4G" to /etc/default/grub, eg. GRUB_CMDLINE_LINUX="memmap=1G!4G"
+ *        then ("sudo" may required)
+ *          for RHEL(BIOS-based): grub2-mkconfig -o /boot/grub2/grub.cfg
+ *          for RHEL(UEFI-based): grub2-mkconfig -o /boot/efi/EFI/redhat/grub.cfg
+ *          for Ubuntu: update-grub2
+ *        finally reboot
+ *        after the host been rebooted, a new /dev/pmem{N} device should exist,
+ *        naming conversion starts at /dev/pmem0
  *
- *  ndctl create-namespace  * -f -e namespace0.0 -m memory -M mem
+ *  Prepare test directory follow below commands, "sudo" may required
+ *  (if ndctl or mkfs.xfs not exist, install ndctl or xfsprogs package first)
+ *  (for RHEL8, when call mkfs.xfs, specify the -m reflink=0 option to disable reflink feature)
+ *
+ *  ndctl create-namespace -f -e namespace0.0 -m memory -M mem
  *  mkdir /mnt/pmem
  *  mkfs.xfs -f /dev/pmem0; mount -o dax /dev/pmem0 /mnt/pmem/
  *  mkdir /mnt/pmem/test; chmod a+rwx /mnt/pmem/test
@@ -71,7 +81,19 @@
  * @summary Testing NVRAM mapped byte buffer support
  * @run main/manual PmemTest
  * @requires (os.family == "linux")
- * @requires ((os.arch == "x86_64")|(os.arch == "amd64")|(os.arch == "aarch64"))
+ * @requires (os.arch == "x86_64")
+ */
+
+/* @test
+ * @summary Testing NVRAM mapped byte buffer support
+ * @run main/manual PmemTest
+ * @requires (os.family == "linux")
+ * @requires ((os.arch == "amd64")|(os.arch == "aarch64")|(os.arch == "ppc64le"))
+ * @ignore The test described here is currently disabled on systems that are not
+ * x64-based and lack an external NVRAM memory device. In order to re-enable the
+ * test, you will need to mount the NVRAM device, which will typically appear as
+ * /dev/pmem0, to the directory /mnt/pmem. Once that is done, you can follow the
+ * instructions above to create a test directory and remove the ignore tag.
  */
 
 import java.io.File;

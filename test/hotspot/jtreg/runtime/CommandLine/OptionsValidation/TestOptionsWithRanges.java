@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,111 +27,121 @@
  * @test
  * @bug 8205633
  * @summary Test VM Options with ranges (1 of 10)
+ * @requires vm.flagless
  * @library /test/lib /runtime/CommandLine/OptionsValidation/common
  * @modules java.base/jdk.internal.misc
  *          java.management
  *          jdk.attach/sun.tools.attach
  *          jdk.internal.jvmstat/sun.jvmstat.monitor
- * @run main/othervm/timeout=1800 TestOptionsWithRanges 1 of 10
+ * @run driver/timeout=1800 TestOptionsWithRanges 1 of 10
  */
 /*
  * @test
  * @bug 8205633
  * @summary Test VM Options with ranges (2 of 10)
+ * @requires vm.flagless
  * @library /test/lib /runtime/CommandLine/OptionsValidation/common
  * @modules java.base/jdk.internal.misc
  *          java.management
  *          jdk.attach/sun.tools.attach
  *          jdk.internal.jvmstat/sun.jvmstat.monitor
- * @run main/othervm/timeout=1800 TestOptionsWithRanges 2 of 10
+ * @run driver/timeout=1800 TestOptionsWithRanges 2 of 10
  */
 /*
  * @test
  * @bug 8205633
  * @summary Test VM Options with ranges (3 of 10)
+ * @requires vm.flagless
  * @library /test/lib /runtime/CommandLine/OptionsValidation/common
  * @modules java.base/jdk.internal.misc
  *          java.management
  *          jdk.attach/sun.tools.attach
  *          jdk.internal.jvmstat/sun.jvmstat.monitor
- * @run main/othervm/timeout=1800 TestOptionsWithRanges 3 of 10
+ * @run driver/timeout=1800 TestOptionsWithRanges 3 of 10
  */
 /*
  * @test
  * @bug 8205633
  * @summary Test VM Options with ranges (4 of 10)
+ * @requires vm.flagless
  * @library /test/lib /runtime/CommandLine/OptionsValidation/common
  * @modules java.base/jdk.internal.misc
  *          java.management
  *          jdk.attach/sun.tools.attach
  *          jdk.internal.jvmstat/sun.jvmstat.monitor
- * @run main/othervm/timeout=1800 TestOptionsWithRanges 4 of 10
+ * @run driver/timeout=1800 TestOptionsWithRanges 4 of 10
  */
 /*
  * @test
  * @bug 8205633
  * @summary Test VM Options with ranges (5 of 10)
+ * @requires vm.flagless
  * @library /test/lib /runtime/CommandLine/OptionsValidation/common
  * @modules java.base/jdk.internal.misc
  *          java.management
  *          jdk.attach/sun.tools.attach
  *          jdk.internal.jvmstat/sun.jvmstat.monitor
- * @run main/othervm/timeout=1800 TestOptionsWithRanges 5 of 10
+ * @run driver/timeout=1800 TestOptionsWithRanges 5 of 10
  */
 /*
  * @test
  * @bug 8205633
  * @summary Test VM Options with ranges (6 of 10)
+ * @requires vm.flagless
  * @library /test/lib /runtime/CommandLine/OptionsValidation/common
  * @modules java.base/jdk.internal.misc
  *          java.management
  *          jdk.attach/sun.tools.attach
  *          jdk.internal.jvmstat/sun.jvmstat.monitor
- * @run main/othervm/timeout=1800 TestOptionsWithRanges 6 of 10
+ * @run driver/timeout=1800 TestOptionsWithRanges 6 of 10
  */
 /*
  * @test
  * @bug 8205633
  * @summary Test VM Options with ranges (7 of 10)
+ * @requires vm.flagless
  * @library /test/lib /runtime/CommandLine/OptionsValidation/common
  * @modules java.base/jdk.internal.misc
  *          java.management
  *          jdk.attach/sun.tools.attach
  *          jdk.internal.jvmstat/sun.jvmstat.monitor
- * @run main/othervm/timeout=1800 TestOptionsWithRanges 7 of 10
+ * @run driver/timeout=1800 TestOptionsWithRanges 7 of 10
  */
 /*
  * @test
  * @bug 8205633
  * @summary Test VM Options with ranges (8 of 10)
+ * @requires vm.flagless
  * @library /test/lib /runtime/CommandLine/OptionsValidation/common
  * @modules java.base/jdk.internal.misc
  *          java.management
  *          jdk.attach/sun.tools.attach
  *          jdk.internal.jvmstat/sun.jvmstat.monitor
- * @run main/othervm/timeout=1800 TestOptionsWithRanges 8 of 10
+ * @run driver/timeout=1800 TestOptionsWithRanges 8 of 10
  */
 /*
  * @test
  * @bug 8205633
  * @summary Test VM Options with ranges (9 of 10)
+ * @requires vm.flagless
  * @library /test/lib /runtime/CommandLine/OptionsValidation/common
  * @modules java.base/jdk.internal.misc
  *          java.management
  *          jdk.attach/sun.tools.attach
  *          jdk.internal.jvmstat/sun.jvmstat.monitor
- * @run main/othervm/timeout=1800 TestOptionsWithRanges 9 of 10
+ * @run driver/timeout=1800 TestOptionsWithRanges 9 of 10
  */
 /*
  * @test
  * @bug 8205633
  * @summary Test VM Options with ranges (10 of 10)
+ * @requires vm.flagless
  * @library /test/lib /runtime/CommandLine/OptionsValidation/common
  * @modules java.base/jdk.internal.misc
  *          java.management
  *          jdk.attach/sun.tools.attach
  *          jdk.internal.jvmstat/sun.jvmstat.monitor
- * @run main/othervm/timeout=1800 TestOptionsWithRanges 10 of 10
+ * @run driver/timeout=1800 TestOptionsWithRanges 10 of 10
  */
 // --- end auto-generated
 
@@ -214,9 +224,10 @@ public class TestOptionsWithRanges {
         excludeTestMaxRange("CICompilerCount");
 
         /*
-         * Exclude MallocMaxTestWords as it is expected to exit VM at small values (>=0)
+         * Exclude JVMCI threads counts from testing similar to other threads counts.
          */
-        excludeTestMinRange("MallocMaxTestWords");
+        excludeTestMaxRange("JVMCIThreads");
+        excludeTestMaxRange("JVMCIHostThreads");
 
         /*
          * Exclude below options as their maximum value would consume too much memory
@@ -224,10 +235,7 @@ public class TestOptionsWithRanges {
          */
         excludeTestMaxRange("ConcGCThreads");
         excludeTestMaxRange("G1ConcRefinementThreads");
-        excludeTestMaxRange("G1RSetRegionEntries");
-        excludeTestMaxRange("G1RSetSparseRegionEntries");
         excludeTestMaxRange("G1UpdateBufferSize");
-        excludeTestMaxRange("InitialBootClassLoaderMetaspaceSize");
         excludeTestMaxRange("InitialHeapSize");
         excludeTestMaxRange("MaxHeapSize");
         excludeTestMaxRange("MaxRAM");
@@ -253,6 +261,14 @@ public class TestOptionsWithRanges {
         excludeTestMaxRange("ProfiledCodeHeapSize");
         excludeTestMaxRange("NonNMethodCodeHeapSize");
         excludeTestMaxRange("CodeCacheExpansionSize");
+
+        /*
+         * Exclude CompileThresholdScaling from max range testing, because
+         * it is expected to print "outside the allowed range" warnings for the
+         * scaled flag and the "outside the allowed range" warning does not
+         * refer to CompileThresholdScaling itself.
+         */
+        excludeTestMaxRange("CompileThresholdScaling");
 
         List<JVMOption> testSubset = getTestSubset(args);
 

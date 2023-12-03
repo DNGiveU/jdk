@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -23,14 +23,13 @@
 
 package gc.arguments;
 
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-import jdk.test.lib.process.ProcessTools;
 import jdk.test.lib.process.OutputAnalyzer;
-import sun.hotspot.WhiteBox;
+import jdk.test.whitebox.WhiteBox;
 
 class ErgoArgsPrinter {
   public static void main(String[] args) throws Exception {
@@ -116,7 +115,7 @@ class TestMaxHeapSizeTools {
   }
 
   private static void getNewOldSize(String gcflag, long[] values) throws Exception {
-    ProcessBuilder pb = GCArguments.createJavaProcessBuilder(gcflag,
+    ProcessBuilder pb = GCArguments.createTestJavaProcessBuilder(gcflag,
       "-XX:+PrintFlagsFinal", "-version");
     OutputAnalyzer output = new OutputAnalyzer(pb.start());
     output.shouldHaveExitValue(0);
@@ -193,10 +192,9 @@ class TestMaxHeapSizeTools {
    * @param vmargs Arguments to the VM to run
    * @param classname Name of the class to run
    * @param arguments Arguments to the class
-   * @param useTestDotJavaDotOpts Use test.java.opts as part of the VM argument string
    * @return The OutputAnalyzer with the results for the invocation.
    */
-  public static OutputAnalyzer runWhiteBoxTest(String[] vmargs, String classname, String[] arguments, boolean useTestDotJavaDotOpts) throws Exception {
+  public static OutputAnalyzer runWhiteBoxTest(String[] vmargs, String classname, String[] arguments) throws Exception {
     ArrayList<String> finalargs = new ArrayList<String>();
 
     String[] whiteboxOpts = new String[] {
@@ -205,22 +203,12 @@ class TestMaxHeapSizeTools {
       "-cp", System.getProperty("java.class.path"),
     };
 
-    if (useTestDotJavaDotOpts) {
-      // System.getProperty("test.java.opts") is '' if no options is set,
-      // we need to skip such a result
-      String[] externalVMOpts = new String[0];
-      if (System.getProperty("test.java.opts") != null && System.getProperty("test.java.opts").length() != 0) {
-        externalVMOpts = System.getProperty("test.java.opts").split(" ");
-      }
-      finalargs.addAll(Arrays.asList(externalVMOpts));
-    }
-
     finalargs.addAll(Arrays.asList(vmargs));
     finalargs.addAll(Arrays.asList(whiteboxOpts));
     finalargs.add(classname);
     finalargs.addAll(Arrays.asList(arguments));
 
-    ProcessBuilder pb = GCArguments.createJavaProcessBuilder(finalargs.toArray(new String[0]));
+    ProcessBuilder pb = GCArguments.createTestJavaProcessBuilder(finalargs.toArray(String[]::new));
     OutputAnalyzer output = new OutputAnalyzer(pb.start());
     output.shouldHaveExitValue(0);
 
@@ -228,7 +216,7 @@ class TestMaxHeapSizeTools {
   }
 
   private static void getMinInitialMaxHeap(String[] args, MinInitialMaxValues val) throws Exception {
-    OutputAnalyzer output = runWhiteBoxTest(args, ErgoArgsPrinter.class.getName(), new String[] {}, false);
+    OutputAnalyzer output = runWhiteBoxTest(args, ErgoArgsPrinter.class.getName(), new String[] {});
 
     // the output we watch for has the following format:
     //
@@ -320,7 +308,7 @@ class TestMaxHeapSizeTools {
   }
 
   private static void expect(String[] flags, boolean hasWarning, boolean hasError, int errorcode) throws Exception {
-    ProcessBuilder pb = GCArguments.createJavaProcessBuilder(flags);
+    ProcessBuilder pb = GCArguments.createTestJavaProcessBuilder(flags);
     OutputAnalyzer output = new OutputAnalyzer(pb.start());
     shouldContainOrNot(output, hasWarning, "Warning");
     shouldContainOrNot(output, hasError, "Error");

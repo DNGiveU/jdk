@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -32,21 +32,23 @@
 // with the ones that should pick up the mocks removed. Those should be included
 // later after the mocks have been defined.
 
-#include "logging/log.hpp"
 #include "jfr/jfrEvents.hpp"
 #include "jfr/metadata/jfrSerializer.hpp"
 #include "jfr/periodic/jfrOSInterface.hpp"
 #include "jfr/utilities/jfrTime.hpp"
 #include "jfr/utilities/jfrTypes.hpp"
+#include "logging/log.hpp"
 #include "runtime/os_perf.hpp"
 #include "utilities/globalDefinitions.hpp"
 #include "utilities/growableArray.hpp"
 
-#include "unittest.hpp"
-
+#include "utilities/vmassert_uninstall.hpp"
 #include <vector>
 #include <list>
 #include <map>
+#include "utilities/vmassert_reinstall.hpp"
+
+#include "unittest.hpp"
 
 namespace {
 
@@ -125,7 +127,10 @@ namespace {
       for (std::list<MockNetworkInterface>::const_iterator i = _interfaces.begin();
            i != _interfaces.end();
            ++i) {
-        NetworkInterface* cur = new NetworkInterface(i->name.c_str(), i->bytes_in, i->bytes_out, *network_interfaces);
+        // The gtests are compiled with exceptions, which requires operator delete.
+        // Allocate in CHeap instead.
+        void* mem = AllocateHeap(sizeof(NetworkInterface), mtTest);
+        NetworkInterface* cur = ::new (mem) NetworkInterface(i->name.c_str(), i->bytes_in, i->bytes_out, *network_interfaces);
         *network_interfaces = cur;
       }
       return OS_OK;
@@ -242,9 +247,11 @@ protected:
   }
 };
 
+static traceid id = 0;
+
 TEST_VM_F(JfrTestNetworkUtilization, RequestFunctionBasic) {
 
-  MockNetworkInterface& eth0 = MockJfrOSInterface::add_interface("eth0", 1);
+  MockNetworkInterface& eth0 = MockJfrOSInterface::add_interface("eth0", ++id);
   JfrNetworkUtilization::send_events();
   ASSERT_EQ(0u, MockEventNetworkUtilization::committed.size());
 
@@ -261,9 +268,9 @@ TEST_VM_F(JfrTestNetworkUtilization, RequestFunctionBasic) {
 
 TEST_VM_F(JfrTestNetworkUtilization, RequestFunctionMultiple) {
 
-  MockNetworkInterface& eth0 = MockJfrOSInterface::add_interface("eth0", 2);
-  MockNetworkInterface& eth1 = MockJfrOSInterface::add_interface("eth1", 3);
-  MockNetworkInterface& ppp0 = MockJfrOSInterface::add_interface("ppp0", 4);
+  MockNetworkInterface& eth0 = MockJfrOSInterface::add_interface("eth0", ++id);
+  MockNetworkInterface& eth1 = MockJfrOSInterface::add_interface("eth1", ++id);
+  MockNetworkInterface& ppp0 = MockJfrOSInterface::add_interface("ppp0", ++id);
   JfrNetworkUtilization::send_events();
   ASSERT_EQ(0u, MockEventNetworkUtilization::committed.size());
 
@@ -292,8 +299,8 @@ TEST_VM_F(JfrTestNetworkUtilization, RequestFunctionMultiple) {
 }
 
 TEST_VM_F(JfrTestNetworkUtilization, InterfaceRemoved) {
-  MockNetworkInterface& eth0 = MockJfrOSInterface::add_interface("eth0", 5);
-  MockNetworkInterface& eth1 = MockJfrOSInterface::add_interface("eth1", 6);
+  MockNetworkInterface& eth0 = MockJfrOSInterface::add_interface("eth0", ++id);
+  MockNetworkInterface& eth1 = MockJfrOSInterface::add_interface("eth1", ++id);
   JfrNetworkUtilization::send_events();
   ASSERT_EQ(0u, MockEventNetworkUtilization::committed.size());
 
@@ -329,7 +336,7 @@ TEST_VM_F(JfrTestNetworkUtilization, InterfaceRemoved) {
 }
 
 TEST_VM_F(JfrTestNetworkUtilization, InterfaceReset) {
-  MockNetworkInterface& eth0 = MockJfrOSInterface::add_interface("eth0", 7);
+  MockNetworkInterface& eth0 = MockJfrOSInterface::add_interface("eth0", ++id);
   JfrNetworkUtilization::send_events();
   ASSERT_EQ(0u, MockEventNetworkUtilization::committed.size());
 

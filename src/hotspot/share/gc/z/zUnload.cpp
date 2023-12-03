@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -29,29 +29,36 @@
 #include "code/dependencyContext.hpp"
 #include "gc/shared/gcBehaviours.hpp"
 #include "gc/shared/suspendibleThreadSet.hpp"
+#include "gc/z/zBarrier.inline.hpp"
+#include "gc/z/zBarrierSetNMethod.hpp"
+#include "gc/z/zGeneration.inline.hpp"
 #include "gc/z/zLock.inline.hpp"
 #include "gc/z/zNMethod.hpp"
-#include "gc/z/zOopClosures.hpp"
 #include "gc/z/zStat.hpp"
+#include "gc/z/zUncoloredRoot.inline.hpp"
 #include "gc/z/zUnload.hpp"
+#include "memory/metaspaceUtils.hpp"
 #include "oops/access.inline.hpp"
 
-static const ZStatSubPhase ZSubPhaseConcurrentClassesUnlink("Concurrent Classes Unlink");
-static const ZStatSubPhase ZSubPhaseConcurrentClassesPurge("Concurrent Classes Purge");
+static const ZStatSubPhase ZSubPhaseConcurrentClassesUnlink("Concurrent Classes Unlink", ZGenerationId::old);
+static const ZStatSubPhase ZSubPhaseConcurrentClassesPurge("Concurrent Classes Purge", ZGenerationId::old);
 
 class ZIsUnloadingOopClosure : public OopClosure {
 private:
-  ZPhantomIsAliveObjectClosure _is_alive;
-  bool                         _is_unloading;
+  const uintptr_t _color;
+  bool            _is_unloading;
 
 public:
-  ZIsUnloadingOopClosure() :
-      _is_alive(),
+  ZIsUnloadingOopClosure(nmethod* nm)
+    : _color(ZNMethod::color(nm)),
       _is_unloading(false) {}
 
   virtual void do_oop(oop* p) {
-    const oop o = RawAccess<>::oop_load(p);
-    if (o != NULL && !_is_alive.do_object_b(o)) {
+    // Create local, aligned root
+    zaddress_unsafe addr = Atomic::load(ZUncoloredRoot::cast(p));
+    ZUncoloredRoot::process_no_keepalive(&addr, _color);
+
+    if (!is_null(addr) && ZHeap::heap()->is_old(safe(addr)) && !ZHeap::heap()->is_object_live(safe(addr))) {
       _is_unloading = true;
     }
   }
@@ -67,12 +74,16 @@ public:
 
 class ZIsUnloadingBehaviour : public IsUnloadingBehaviour {
 public:
-  virtual bool is_unloading(CompiledMethod* method) const {
+  virtual bool has_dead_oop(CompiledMethod* method) const {
     nmethod* const nm = method->as_nmethod();
     ZReentrantLock* const lock = ZNMethod::lock_for_nmethod(nm);
     ZLocker<ZReentrantLock> locker(lock);
-    ZIsUnloadingOopClosure cl;
-    ZNMethod::nmethod_oops_do(nm, &cl);
+    if (!ZNMethod::is_armed(nm)) {
+      // Disarmed nmethods are alive
+      return false;
+    }
+    ZIsUnloadingOopClosure cl(nm);
+    ZNMethod::nmethod_oops_do_inner(nm, &cl);
     return cl.is_unloading();
   }
 };
@@ -103,8 +114,8 @@ public:
   }
 };
 
-ZUnload::ZUnload(ZWorkers* workers) :
-    _workers(workers) {
+ZUnload::ZUnload(ZWorkers* workers)
+  : _workers(workers) {
 
   if (!ClassUnloading) {
     return;
@@ -131,13 +142,13 @@ void ZUnload::unlink() {
     return;
   }
 
-  ZStatTimer timer(ZSubPhaseConcurrentClassesUnlink);
-  SuspendibleThreadSetJoiner sts;
+  ZStatTimerOld timer(ZSubPhaseConcurrentClassesUnlink);
+  SuspendibleThreadSetJoiner sts_joiner;
   bool unloading_occurred;
 
   {
     MutexLocker ml(ClassLoaderDataGraph_lock);
-    unloading_occurred = SystemDictionary::do_unloading(ZStatPhase::timer());
+    unloading_occurred = SystemDictionary::do_unloading(ZGeneration::old()->gc_timer());
   }
 
   Klass::clean_weak_klass_links(unloading_occurred);
@@ -150,19 +161,19 @@ void ZUnload::purge() {
     return;
   }
 
-  ZStatTimer timer(ZSubPhaseConcurrentClassesPurge);
+  ZStatTimerOld timer(ZSubPhaseConcurrentClassesPurge);
 
   {
-    SuspendibleThreadSetJoiner sts;
-    ZNMethod::purge(_workers);
+    SuspendibleThreadSetJoiner sts_joiner;
+    ZNMethod::purge();
   }
 
-  ClassLoaderDataGraph::purge();
+  ClassLoaderDataGraph::purge(/*at_safepoint*/false);
   CodeCache::purge_exception_caches();
 }
 
 void ZUnload::finish() {
   // Resize and verify metaspace
   MetaspaceGC::compute_new_size();
-  MetaspaceUtils::verify_metrics();
+  DEBUG_ONLY(MetaspaceUtils::verify();)
 }

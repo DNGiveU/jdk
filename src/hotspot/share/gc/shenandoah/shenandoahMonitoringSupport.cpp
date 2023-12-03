@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2015, 2018, Red Hat, Inc. All rights reserved.
+ * Copyright (c) 2015, 2019, Red Hat, Inc. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License version 2 only, as
@@ -26,7 +27,7 @@
 #include "gc/shared/generationCounters.hpp"
 #include "gc/shared/hSpaceCounters.hpp"
 #include "gc/shenandoah/shenandoahMonitoringSupport.hpp"
-#include "gc/shenandoah/shenandoahHeap.hpp"
+#include "gc/shenandoah/shenandoahHeap.inline.hpp"
 #include "gc/shenandoah/shenandoahHeapRegionCounters.hpp"
 #include "memory/metaspaceCounters.hpp"
 #include "services/memoryService.hpp"
@@ -56,8 +57,8 @@ public:
 };
 
 ShenandoahMonitoringSupport::ShenandoahMonitoringSupport(ShenandoahHeap* heap) :
-        _partial_counters(NULL),
-        _full_counters(NULL)
+        _partial_counters(nullptr),
+        _full_counters(nullptr)
 {
   // Collection counters do not fit Shenandoah very well.
   // We record partial cycles as "young", and full cycles (including full STW GC) as "old".
@@ -100,6 +101,5 @@ void ShenandoahMonitoringSupport::update_counters() {
     _heap_region_counters->update();
 
     MetaspaceCounters::update_performance_counters();
-    CompressedClassSpaceCounters::update_performance_counters();
   }
 }

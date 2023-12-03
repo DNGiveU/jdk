@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1999, 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1999, 2019, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -35,7 +35,9 @@ import java.util.function.ToIntBiFunction;
 import java.util.function.ToIntFunction;
 
 import static com.sun.tools.javac.code.TypeTag.BOT;
+import static com.sun.tools.javac.code.TypeTag.DOUBLE;
 import static com.sun.tools.javac.code.TypeTag.INT;
+import static com.sun.tools.javac.code.TypeTag.LONG;
 import static com.sun.tools.javac.jvm.ByteCodes.*;
 import static com.sun.tools.javac.jvm.ClassFile.CONSTANT_Class;
 import static com.sun.tools.javac.jvm.ClassFile.CONSTANT_Double;
@@ -50,6 +52,7 @@ import static com.sun.tools.javac.jvm.ClassFile.CONSTANT_Methodref;
 import static com.sun.tools.javac.jvm.ClassFile.CONSTANT_String;
 import static com.sun.tools.javac.jvm.UninitializedType.*;
 import static com.sun.tools.javac.jvm.ClassWriter.StackMapTableFrame;
+import java.util.Arrays;
 
 /** An internal structure that corresponds to the code attribute of
  *  methods in a classfile. The class also provides some utility operations to
@@ -400,10 +403,12 @@ public class Code {
     */
     public void emitLdc(LoadableConstant constant) {
         int od = poolWriter.putConstant(constant);
-        if (od <= 255) {
+        Type constantType = types.constantType(constant);
+        if (constantType.hasTag(LONG) || constantType.hasTag(DOUBLE)) {
+            emitop2(ldc2w, od, constant);
+        } else if (od <= 255) {
             emitop1(ldc1, od, constant);
-        }
-        else {
+        } else {
             emitop2(ldc2, od, constant);
         }
     }
@@ -620,7 +625,7 @@ public class Code {
             markDead();
             break;
         case athrow:
-            state.pop(1);
+            state.pop(state.stacksize);
             markDead();
             break;
         case lstore_0:
@@ -1061,15 +1066,13 @@ public class Code {
             Type t = types.erasure((Type)data);
             state.push(t);
             break; }
+        case ldc2:
         case ldc2w:
             state.push(types.constantType((LoadableConstant)data));
             break;
         case instanceof_:
             state.pop(1);
             state.push(syms.intType);
-            break;
-        case ldc2:
-            state.push(types.constantType((LoadableConstant)data));
             break;
         case jsr:
             break;
@@ -2014,7 +2017,7 @@ public class Code {
             if (localVar != null) {
                 for (LocalVar.Range range: localVar.aliveRanges) {
                     if (range.closed() && range.start_pc + range.length >= oldCP) {
-                        range.length += delta;
+                        range.length += (char)delta;
                     }
                 }
             }
@@ -2075,6 +2078,7 @@ public class Code {
                 lvar[adr] = v.dup();
                 v.closeRange(length);
                 putVar(v);
+                fillLocalVarPosition(v);
             } else {
                 v.removeLastRange();
             }
@@ -2106,18 +2110,29 @@ public class Code {
     private void fillLocalVarPosition(LocalVar lv) {
         if (lv == null || lv.sym == null || lv.sym.isExceptionParameter()|| !lv.sym.hasTypeAnnotations())
             return;
-        LocalVar.Range widestRange = lv.getWidestRange();
+        LocalVar.Range[] validRanges = lv.aliveRanges.stream().filter(r -> r.closed() && r.length > 0).toArray(s -> new LocalVar.Range[s]);
+        if (validRanges.length == 0)
+            return ;
+        int[] lvarOffset = Arrays.stream(validRanges).mapToInt(r -> r.start_pc).toArray();
+        int[] lvarLength = Arrays.stream(validRanges).mapToInt(r -> r.length).toArray();
+        int[] lvarIndex = Arrays.stream(validRanges).mapToInt(r -> lv.reg).toArray();
         for (Attribute.TypeCompound ta : lv.sym.getRawTypeAttributes()) {
             TypeAnnotationPosition p = ta.position;
-            if (widestRange.closed() && widestRange.length > 0) {
-                p.lvarOffset = new int[] { (int)widestRange.start_pc };
-                p.lvarLength = new int[] { (int)widestRange.length };
-                p.lvarIndex = new int[] { (int)lv.reg };
-                p.isValidOffset = true;
-            } else {
-                p.isValidOffset = false;
-            }
+            p.lvarOffset = appendArray(p.lvarOffset, lvarOffset);
+            p.lvarLength = appendArray(p.lvarLength, lvarLength);
+            p.lvarIndex = appendArray(p.lvarIndex, lvarIndex);
+            p.isValidOffset = true;
         }
+    }
+
+    private int[] appendArray(int[] source, int[] append) {
+        if (source == null || source.length == 0) return append;
+
+        int[] result = new int[source.length + append.length];
+
+        System.arraycopy(source, 0, result, 0, source.length);
+        System.arraycopy(append, 0, result, source.length, append.length);
+        return result;
     }
 
     // Method to be called after compressCatchTable to
@@ -2176,6 +2191,8 @@ public class Code {
                 ((var.sym.owner.flags() & Flags.LAMBDA_METHOD) == 0 ||
                  (var.sym.flags() & Flags.PARAMETER) == 0);
         if (ignoredSyntheticVar) return;
+        //don't include unnamed variables:
+        if (var.sym.name == var.sym.name.table.names.empty) return ;
         if (varBuffer == null)
             varBuffer = new LocalVar[20];
         else
@@ -2230,7 +2247,7 @@ public class Code {
     }
 
     private static class Mneumonics {
-        private final static String[] mnem = new String[ByteCodeCount];
+        private static final String[] mnem = new String[ByteCodeCount];
         static {
             mnem[nop] = "nop";
             mnem[aconst_null] = "aconst_null";

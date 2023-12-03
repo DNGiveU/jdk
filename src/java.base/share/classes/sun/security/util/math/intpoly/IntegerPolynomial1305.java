@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -35,7 +35,7 @@ import java.nio.*;
  * The representation uses 5 signed long values.
  */
 
-public class IntegerPolynomial1305 extends IntegerPolynomial {
+public final class IntegerPolynomial1305 extends IntegerPolynomial {
 
     protected static final int SUBTRAHEND = 5;
     protected static final int NUM_LIMBS = 5;
@@ -44,7 +44,9 @@ public class IntegerPolynomial1305 extends IntegerPolynomial {
     private static final BigInteger MODULUS
         = TWO.pow(POWER).subtract(BigInteger.valueOf(SUBTRAHEND));
 
-    public IntegerPolynomial1305() {
+    public static final IntegerPolynomial1305 ONE = new IntegerPolynomial1305();
+
+    private IntegerPolynomial1305() {
         super(BITS_PER_LIMB, NUM_LIMBS, 1, MODULUS);
     }
 
@@ -125,6 +127,8 @@ public class IntegerPolynomial1305 extends IntegerPolynomial {
     @Override
     protected void encode(ByteBuffer buf, int length, byte highByte,
                           long[] result) {
+        ByteOrder currOrder = buf.order();
+        buf.order(ByteOrder.LITTLE_ENDIAN);
         if (length == 16) {
             long low = buf.getLong();
             long high = buf.getLong();
@@ -132,6 +136,7 @@ public class IntegerPolynomial1305 extends IntegerPolynomial {
         } else {
             super.encode(buf, length, highByte, result);
         }
+        buf.order(currOrder);
     }
 
     protected void encode(long high, long low, byte highByte, long[] result) {
@@ -156,7 +161,8 @@ public class IntegerPolynomial1305 extends IntegerPolynomial {
         }
     }
 
-    private void modReduceIn(long[] limbs, int index, long x) {
+    @Override
+    protected void reduceIn(long[] limbs, long x, int index) {
         // this only works when BITS_PER_LIMB * NUM_LIMBS = POWER exactly
         long reducedValue = (x * SUBTRAHEND);
         limbs[index - NUM_LIMBS] += reducedValue;
@@ -166,13 +172,13 @@ public class IntegerPolynomial1305 extends IntegerPolynomial {
     protected void finalCarryReduceLast(long[] limbs) {
         long carry = limbs[numLimbs - 1] >> bitsPerLimb;
         limbs[numLimbs - 1] -= carry << bitsPerLimb;
-        modReduceIn(limbs, numLimbs, carry);
+        reduceIn(limbs, carry, numLimbs);
     }
 
     protected final void modReduce(long[] limbs, int start, int end) {
 
         for (int i = start; i < end; i++) {
-            modReduceIn(limbs, i, limbs[i]);
+            reduceIn(limbs, limbs[i], i);
             limbs[i] = 0;
         }
     }
@@ -203,7 +209,7 @@ public class IntegerPolynomial1305 extends IntegerPolynomial {
         long carry4 = carryValue(new4);
         limbs[4] = new4 - (carry4 << BITS_PER_LIMB);
 
-        modReduceIn(limbs, 5, carry4);
+        reduceIn(limbs, carry4, 5);
         carry(limbs);
     }
 

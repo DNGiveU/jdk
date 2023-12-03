@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -29,7 +29,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.util.Optional;
-import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Supplier;
 import javax.net.ssl.SSLSession;
 import java.net.http.HttpClient;
@@ -123,12 +123,36 @@ class HttpResponseImpl<T> implements HttpResponse<T>, RawChannel.Provider {
      *         the channel.
      */
     @Override
-    public synchronized RawChannel rawChannel() throws IOException {
+    public RawChannel rawChannel() throws IOException {
         if (rawChannelProvider == null) {
             throw new UnsupportedOperationException(
                     "RawChannel is only supported for WebSocket creation");
         }
         return rawChannelProvider.rawChannel();
+    }
+
+    /**
+     * Closes the RawChannel that may have been used for WebSocket protocol.
+     *
+     * @apiNote This method should be called to close the connection
+     * if an exception occurs during the websocket handshake, in cases where
+     * {@link #rawChannel() rawChannel().close()} would have been called.
+     * An unsuccessful handshake may prevent the creation of the RawChannel:
+     * if a RawChannel has already been created, this method wil close it.
+     * Otherwise, it will close the connection.
+     *
+     * @throws UnsupportedOperationException if getting a RawChannel over
+     *         this connection is not supported.
+     * @throws IOException if an I/O exception occurs while closing
+     *         the channel.
+     */
+    @Override
+    public void closeRawChannel() throws IOException {
+        if (rawChannelProvider == null) {
+            throw new UnsupportedOperationException(
+                    "RawChannel is only supported for WebSocket creation");
+        }
+        rawChannelProvider.closeRawChannel();
     }
 
     @Override
@@ -156,6 +180,7 @@ class HttpResponseImpl<T> implements HttpResponse<T>, RawChannel.Provider {
         private final HttpConnection connection;
         private final Exchange<?> exchange;
         private RawChannel rawchan;
+        private final ReentrantLock stateLock = new ReentrantLock();
         RawChannelProvider(HttpConnection conn, Exchange<?> exch) {
             connection = conn;
             exchange = exch;
@@ -169,7 +194,16 @@ class HttpResponseImpl<T> implements HttpResponse<T>, RawChannel.Provider {
         }
 
         @Override
-        public synchronized RawChannel rawChannel() {
+        public RawChannel rawChannel() {
+            stateLock.lock();
+            try {
+                return rawChannel0();
+            } finally {
+                stateLock.unlock();
+            }
+        }
+
+        private RawChannel rawChannel0() {
             if (rawchan == null) {
                 ExchangeImpl<?> exchImpl = exchangeImpl();
                 if (!(exchImpl instanceof Http1Exchange)) {
@@ -187,6 +221,18 @@ class HttpResponseImpl<T> implements HttpResponse<T>, RawChannel.Provider {
                 rawchan = new RawChannelTube(connection, initial);
             }
             return rawchan;
+        }
+
+        public void closeRawChannel() throws IOException {
+            //  close the rawChannel, if created, or the
+            // connection, if not.
+            stateLock.lock();
+            try {
+                if (rawchan != null) rawchan.close();
+                else connection.close();
+            } finally {
+                stateLock.unlock();
+            }
         }
 
         private static HttpConnection connection(Response resp, Exchange<?> exch) {

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2023, Oracle and/or its affiliates. All rights reserved.
  */
 /*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -22,50 +22,45 @@ package com.sun.org.apache.bcel.internal.util;
 import com.sun.org.apache.bcel.internal.classfile.JavaClass;
 
 /**
- * Abstract definition of a class repository. Instances may be used
- * to load classes from different sources and may be used in the
- * Repository.setRepository method.
+ * Abstract definition of a class repository. Instances may be used to load classes from different sources and may be
+ * used in the Repository.setRepository method.
  *
- * @see com.sun.org.apache.bcel.internal.Repository
- * @version $Id$
- * @LastModified: Jun 2019
+ * @see org.apache.bcel.Repository
+ * @LastModified: Feb 2023
  */
 public interface Repository {
-
-    /**
-     * Stores the provided class under "clazz.getClassName()"
-     */
-    void storeClass( JavaClass clazz );
-
-
-    /**
-     * Removes class from repository
-     */
-    void removeClass( JavaClass clazz );
-
-
-    /**
-     * Finds the class with the name provided, if the class
-     * isn't there, return NULL.
-     */
-    JavaClass findClass( String className );
-
-
-    /**
-     * Finds the class with the name provided, if the class
-     * isn't there, make an attempt to load it.
-     */
-    JavaClass loadClass( String className ) throws java.lang.ClassNotFoundException;
-
-
-    /**
-     * Finds the JavaClass instance for the given run-time class object
-     */
-    JavaClass loadClass( Class<?> clazz ) throws java.lang.ClassNotFoundException;
-
 
     /**
      * Clears all entries from cache.
      */
     void clear();
+
+    /**
+     * Finds the class with the name provided, if the class isn't there, return NULL.
+     */
+    JavaClass findClass(String className);
+
+    /**
+     * Finds the JavaClass instance for the given run-time class object.
+     *
+     * @throws ClassNotFoundException if the class can't be found.
+     */
+    JavaClass loadClass(Class<?> clazz) throws ClassNotFoundException;
+
+    /**
+     * Finds the class with the name provided, if the class isn't there, make an attempt to load it.
+     *
+     * @throws ClassNotFoundException if the class can't be found.
+     */
+    JavaClass loadClass(String className) throws ClassNotFoundException;
+
+    /**
+     * Removes class from repository
+     */
+    void removeClass(JavaClass clazz);
+
+    /**
+     * Stores the provided class under "clazz.getClassName()"
+     */
+    void storeClass(JavaClass clazz);
 }

@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, Red Hat, Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,12 +25,12 @@
 /*
  * @test
  * @summary Stress test for malloc tracking
- * @key nmt jcmd stress
+ * @key stress randomness
  * @library /test/lib
  * @modules java.base/jdk.internal.misc
  *          java.management
- * @build sun.hotspot.WhiteBox
- * @run driver ClassFileInstaller sun.hotspot.WhiteBox
+ * @build jdk.test.whitebox.WhiteBox
+ * @run driver jdk.test.lib.helpers.ClassFileInstaller jdk.test.whitebox.WhiteBox
  * @run main/othervm/timeout=1200 -Xbootclasspath/a:. -XX:+UnlockDiagnosticVMOptions -XX:+WhiteBoxAPI -XX:NativeMemoryTracking=detail MallocStressTest
  */
 
@@ -39,9 +40,10 @@ import java.util.List;
 import java.util.Random;
 import jdk.test.lib.JDKToolFinder;
 import jdk.test.lib.Platform;
+import jdk.test.lib.Utils;
 import jdk.test.lib.process.ProcessTools;
 import jdk.test.lib.process.OutputAnalyzer;
-import sun.hotspot.WhiteBox;
+import jdk.test.whitebox.WhiteBox;
 
 public class MallocStressTest {
     private static int K = 1024;
@@ -129,7 +131,7 @@ public class MallocStressTest {
 
         // All test memory allocated should be released
         output = new OutputAnalyzer(pb.start());
-        output.shouldNotContain("Test (reserved=");
+        output.shouldContain("Test (reserved=0KB, committed=0KB)");
 
         // Verify that tracking level has not been downgraded
         pb.command(new String[] { JDKToolFinder.getJDKTool("jcmd"), pid, "VM.native_memory", "statistics"});
@@ -159,6 +161,7 @@ public class MallocStressTest {
     }
 
     static class AllocThread extends Thread {
+        private final Random random = new Random(Utils.getRandomInstance().nextLong());
         AllocThread() {
             this.setName("MallocThread");
             this.start();
@@ -166,7 +169,6 @@ public class MallocStressTest {
 
         // AllocThread only runs "Alloc" phase
         public void run() {
-            Random random = new Random();
             // MallocStressTest.phase == TestPhase.alloc
             for (int loops = 0; loops < 100; loops++) {
                 int r = random.nextInt(Integer.MAX_VALUE);
@@ -201,7 +203,7 @@ public class MallocStressTest {
     }
 
     static class ReleaseThread extends Thread {
-        private Random random = new Random();
+        private final Random random = new Random(Utils.getRandomInstance().nextLong());
         ReleaseThread() {
             this.setName("ReleaseThread");
             this.start();

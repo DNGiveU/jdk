@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2001, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -104,7 +104,7 @@ public class addthreadfilter002 {
         if (exitCode != PASSED) {
             System.out.println("TEST FAILED");
         }
-        return testExitCode;
+        return exitCode;
     }
 
     //--------------------------------------------------   log procedures
@@ -144,12 +144,6 @@ public class addthreadfilter002 {
 
     static int  testExitCode = PASSED;
 
-
-    class JDITestRuntimeException extends RuntimeException {
-        JDITestRuntimeException(String str) {
-            super("JDITestRuntimeException : " + str);
-        }
-    }
 
     //------------------------------------------------------ methods
 
@@ -295,7 +289,7 @@ public class addthreadfilter002 {
         String lineForComm  = "lineForComm";
         BreakpointRequest bpRequest;
 
-        ThreadReference mainThread = threadByName("main");
+        ThreadReference mainThread = debuggee.threadByNameOrThrow("main");
 
         bpRequest = settingBreakpoint(mainThread,
                                       debuggeeClass,
@@ -380,20 +374,6 @@ public class addthreadfilter002 {
         }
         log1("    TESTING ENDS");
         return;
-    }
-
-    private ThreadReference threadByName(String name)
-                 throws JDITestRuntimeException {
-
-        List         all = vm.allThreads();
-        ListIterator li  = all.listIterator();
-
-        for (; li.hasNext(); ) {
-            ThreadReference thread = (ThreadReference) li.next();
-            if (thread.name().equals(name))
-                return thread;
-        }
-        throw new JDITestRuntimeException("** Thread IS NOT found ** : " + name);
     }
 
    /*

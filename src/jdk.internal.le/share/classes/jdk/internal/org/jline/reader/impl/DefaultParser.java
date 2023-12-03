@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2002-2018, the original author or authors.
+ * Copyright (c) 2002-2020, the original author or authors.
  *
  * This software is distributable under the BSD license. See the terms of the
  * BSD license in the documentation provided with this software.
@@ -10,6 +10,8 @@ package jdk.internal.org.jline.reader.impl;
 
 import java.util.*;
 import java.util.function.Predicate;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import jdk.internal.org.jline.reader.CompletingParsedLine;
 import jdk.internal.org.jline.reader.EOFError;
@@ -22,7 +24,28 @@ public class DefaultParser implements Parser {
         ROUND,   // ()
         CURLY,   // {}
         SQUARE,  // []
-        ANGLE;   // <>
+        ANGLE    // <>
+    }
+
+    public static class BlockCommentDelims {
+        private final String start;
+        private final String end;
+        public BlockCommentDelims(String start, String end) {
+            if (start == null || end == null
+              || start.isEmpty() || end.isEmpty() || start.equals(end)) {
+                throw new IllegalArgumentException("Bad block comment delimiter!");
+            }
+            this.start = start;
+            this.end = end;
+        }
+
+        public String getStart() {
+            return start;
+        }
+
+        public String getEnd() {
+            return end;
+        }
     }
 
     private char[] quoteChars = {'\'', '"'};
@@ -37,9 +60,27 @@ public class DefaultParser implements Parser {
 
     private char[] closingBrackets = null;
 
+    private String[] lineCommentDelims = null;
+
+    private BlockCommentDelims blockCommentDelims = null;
+
+    private String regexVariable = "[a-zA-Z_]+[a-zA-Z0-9_-]*((\\.|\\['|\\[\"|\\[)[a-zA-Z0-9_-]*(|']|\"]|]))?";
+    private String regexCommand = "[:]?[a-zA-Z]+[a-zA-Z0-9_-]*";
+    private int commandGroup = 4;
+
     //
     // Chainable setters
     //
+
+    public DefaultParser lineCommentDelims(final String[] lineCommentDelims) {
+        this.lineCommentDelims = lineCommentDelims;
+        return this;
+    }
+
+    public DefaultParser blockCommentDelims(final BlockCommentDelims blockCommentDelims) {
+        this.blockCommentDelims = blockCommentDelims;
+        return this;
+    }
 
     public DefaultParser quoteChars(final char[] chars) {
         this.quoteChars = chars;
@@ -56,13 +97,28 @@ public class DefaultParser implements Parser {
         return this;
     }
 
-    public DefaultParser eofOnUnclosedBracket(Bracket... brackets){
+    public DefaultParser eofOnUnclosedBracket(Bracket... brackets) {
         setEofOnUnclosedBracket(brackets);
         return this;
     }
 
     public DefaultParser eofOnEscapedNewLine(boolean eofOnEscapedNewLine) {
         this.eofOnEscapedNewLine = eofOnEscapedNewLine;
+        return this;
+    }
+
+    public DefaultParser regexVariable(String regexVariable) {
+        this.regexVariable = regexVariable;
+        return this;
+    }
+
+    public DefaultParser regexCommand(String regexCommand) {
+        this.regexCommand = regexCommand;
+        return this;
+    }
+
+    public DefaultParser commandGroup(int commandGroup) {
+        this.commandGroup = commandGroup;
         return this;
     }
 
@@ -86,6 +142,22 @@ public class DefaultParser implements Parser {
         return this.escapeChars;
     }
 
+    public void setLineCommentDelims(String[] lineCommentDelims) {
+        this.lineCommentDelims = lineCommentDelims;
+    }
+
+    public String[] getLineCommentDelims() {
+        return this.lineCommentDelims;
+    }
+
+    public void setBlockCommentDelims(BlockCommentDelims blockCommentDelims) {
+        this.blockCommentDelims = blockCommentDelims;
+    }
+
+    public BlockCommentDelims getBlockCommentDelims() {
+        return blockCommentDelims;
+    }
+
     public void setEofOnUnclosedQuote(boolean eofOnUnclosedQuote) {
         this.eofOnUnclosedQuote = eofOnUnclosedQuote;
     }
@@ -102,7 +174,7 @@ public class DefaultParser implements Parser {
         return eofOnEscapedNewLine;
     }
 
-    public void setEofOnUnclosedBracket(Bracket... brackets){
+    public void setEofOnUnclosedBracket(Bracket... brackets) {
         if (brackets == null) {
             openingBrackets = null;
             closingBrackets = null;
@@ -135,6 +207,64 @@ public class DefaultParser implements Parser {
         }
     }
 
+    public void setRegexVariable(String regexVariable) {
+        this.regexVariable = regexVariable;
+    }
+
+    public void setRegexCommand(String regexCommand) {
+        this.regexCommand = regexCommand;
+    }
+
+    public void setCommandGroup(int commandGroup) {
+        this.commandGroup = commandGroup;
+    }
+
+    @Override
+    public boolean validCommandName(String name) {
+        return name != null && name.matches(regexCommand);
+    }
+
+    @Override
+    public boolean validVariableName(String name) {
+        return name != null && regexVariable != null && name.matches(regexVariable);
+    }
+
+
+    @Override
+    public String getCommand(final String line) {
+        String out = "";
+        boolean checkCommandOnly = regexVariable == null;
+        if (!checkCommandOnly) {
+            Pattern patternCommand = Pattern.compile("^\\s*" + regexVariable + "=(" + regexCommand + ")(\\s+|$)");
+            Matcher matcher = patternCommand.matcher(line);
+            if (matcher.find()) {
+                out = matcher.group(commandGroup);
+            } else {
+                checkCommandOnly = true;
+            }
+        }
+        if (checkCommandOnly) {
+            out = line.trim().split("\\s+")[0];
+            if (!out.matches(regexCommand)) {
+                out = "";
+            }
+        }
+        return out;
+    }
+
+    @Override
+    public String getVariable(final String line) {
+        String out = null;
+        if (regexVariable != null) {
+            Pattern patternCommand = Pattern.compile("^\\s*(" + regexVariable + ")\\s*=[^=~].*");
+            Matcher matcher = patternCommand.matcher(line);
+            if (matcher.find()) {
+                out = matcher.group(1);
+            }
+        }
+        return out;
+    }
+
     public ParsedLine parse(final String line, final int cursor, ParseContext context) {
         List<String> words = new LinkedList<>();
         StringBuilder current = new StringBuilder();
@@ -144,8 +274,13 @@ public class DefaultParser implements Parser {
         int rawWordCursor = -1;
         int rawWordLength = -1;
         int rawWordStart = 0;
-        BracketChecker bracketChecker = new BracketChecker();
+        BracketChecker bracketChecker = new BracketChecker(cursor);
         boolean quotedWord = false;
+        boolean lineCommented = false;
+        boolean blockCommented = false;
+        boolean blockCommentInRightOrder = true;
+        final String blockCommentEnd = blockCommentDelims == null ? null : blockCommentDelims.end;
+        final String blockCommentStart = blockCommentDelims == null ? null : blockCommentDelims.start;
 
         for (int i = 0; (line != null) && (i < line.length()); i++) {
             // once we reach the cursor, set the
@@ -158,17 +293,20 @@ public class DefaultParser implements Parser {
                 rawWordCursor = i - rawWordStart;
             }
 
-            if (quoteStart < 0 && isQuoteChar(line, i)) {
+            if (quoteStart < 0 && isQuoteChar(line, i) && !lineCommented && !blockCommented) {
                 // Start a quote block
                 quoteStart = i;
                 if (current.length()==0) {
                     quotedWord = true;
+                    if (context == ParseContext.SPLIT_LINE) {
+                        current.append(line.charAt(i));
+                    }
                 } else {
                     current.append(line.charAt(i));
                 }
             } else if (quoteStart >= 0 && line.charAt(quoteStart) == line.charAt(i) && !isEscaped(line, i)) {
                 // End quote block
-                if (!quotedWord) {
+                if (!quotedWord || context == ParseContext.SPLIT_LINE) {
                     current.append(line.charAt(i));
                 } else if (rawWordCursor >= 0 && rawWordLength < 0) {
                     rawWordLength = i - rawWordStart + 1;
@@ -176,21 +314,46 @@ public class DefaultParser implements Parser {
                 quoteStart = -1;
                 quotedWord = false;
             } else if (quoteStart < 0 && isDelimiter(line, i)) {
-                // Delimiter
-                if (current.length() > 0) {
-                    words.add(current.toString());
-                    current.setLength(0); // reset the arg
-                    if (rawWordCursor >= 0 && rawWordLength < 0) {
-                        rawWordLength = i - rawWordStart;
+                if (lineCommented) {
+                    if (isCommentDelim(line, i, System.lineSeparator())) {
+                        lineCommented = false;
                     }
+                } else if (blockCommented) {
+                    if (isCommentDelim(line, i, blockCommentEnd)) {
+                        blockCommented = false;
+                    }
+                } else {
+                    // Delimiter
+                    rawWordLength = handleDelimiterAndGetRawWordLength(current, words, rawWordStart, rawWordCursor, rawWordLength, i);
+                    rawWordStart = i + 1;
                 }
-                rawWordStart = i + 1;
             } else {
-                if (!isEscapeChar(line, i)) {
+                if (quoteStart < 0 && !blockCommented && (lineCommented || isLineCommentStarted(line, i))) {
+                    lineCommented = true;
+                } else if (quoteStart < 0 && !lineCommented
+                        && (blockCommented || isCommentDelim(line, i, blockCommentStart))) {
+                    if (blockCommented) {
+                        if (blockCommentEnd != null && isCommentDelim(line, i, blockCommentEnd)) {
+                            blockCommented = false;
+                            i += blockCommentEnd.length() - 1;
+                        }
+                    } else {
+                        blockCommented = true;
+                        rawWordLength = handleDelimiterAndGetRawWordLength(current, words, rawWordStart, rawWordCursor, rawWordLength, i);
+                        i += blockCommentStart == null ? 0 : blockCommentStart.length() - 1;
+                        rawWordStart = i + 1;
+                    }
+                } else if (quoteStart < 0 && !lineCommented
+                        && isCommentDelim(line, i, blockCommentEnd)) {
+                    current.append(line.charAt(i));
+                    blockCommentInRightOrder = false;
+                } else if (!isEscapeChar(line, i)) {
                     current.append(line.charAt(i));
                     if (quoteStart < 0) {
                         bracketChecker.check(line, i);
                     }
+                } else if (context == ParseContext.SPLIT_LINE) {
+                    current.append(line.charAt(i));
                 }
             }
         }
@@ -209,7 +372,7 @@ public class DefaultParser implements Parser {
             rawWordLength = rawWordCursor;
         }
 
-        if (context != ParseContext.COMPLETE) {
+        if (context != ParseContext.COMPLETE && context != ParseContext.SPLIT_LINE) {
             if (eofOnEscapedNewLine && isEscapeChar(line, line.length() - 1)) {
                 throw new EOFError(-1, -1, "Escaped new line", "newline");
             }
@@ -217,11 +380,26 @@ public class DefaultParser implements Parser {
                 throw new EOFError(-1, -1, "Missing closing quote", line.charAt(quoteStart) == '\''
                         ? "quote" : "dquote");
             }
-            if (bracketChecker.isOpeningBracketMissing()) {
-                throw new EOFError(-1, -1, "Missing opening bracket", "missing: " + bracketChecker.getMissingOpeningBracket());
+            if (blockCommented) {
+                throw new EOFError(-1, -1, "Missing closing block comment delimiter",
+                        "add: " + blockCommentEnd);
             }
-            if (bracketChecker.isClosingBracketMissing()) {
-                throw new EOFError(-1, -1, "Missing closing brackets", "add: " + bracketChecker.getMissingClosingBrackets());
+            if (!blockCommentInRightOrder) {
+                throw new EOFError(-1, -1, "Missing opening block comment delimiter",
+                        "missing: " + blockCommentStart);
+            }
+            if (bracketChecker.isClosingBracketMissing() || bracketChecker.isOpeningBracketMissing()) {
+                String message = null;
+                String missing = null;
+                if (bracketChecker.isClosingBracketMissing()) {
+                    message = "Missing closing brackets";
+                    missing = "add: " + bracketChecker.getMissingClosingBrackets();
+                } else {
+                    message = "Missing opening bracket";
+                    missing = "missing: " + bracketChecker.getMissingOpeningBracket();
+                }
+                throw new EOFError(-1, -1, message, missing,
+                        bracketChecker.getOpenBrackets(), bracketChecker.getNextClosingBracket());
             }
         }
 
@@ -242,6 +420,17 @@ public class DefaultParser implements Parser {
         return !isQuoted(buffer, pos) && !isEscaped(buffer, pos) && isDelimiterChar(buffer, pos);
     }
 
+    private int handleDelimiterAndGetRawWordLength(StringBuilder current, List<String> words, int rawWordStart, int rawWordCursor, int rawWordLength, int pos) {
+        if (current.length() > 0) {
+            words.add(current.toString());
+            current.setLength(0); // reset the arg
+            if (rawWordCursor >= 0 && rawWordLength < 0) {
+                return pos - rawWordStart;
+            }
+        }
+        return rawWordLength;
+    }
+
     public boolean isQuoted(final CharSequence buffer, final int pos) {
         return false;
     }
@@ -254,6 +443,36 @@ public class DefaultParser implements Parser {
             for (char e : quoteChars) {
                 if (e == buffer.charAt(pos)) {
                     return !isEscaped(buffer, pos);
+                }
+            }
+        }
+        return false;
+    }
+
+    private boolean isCommentDelim(final CharSequence buffer, final int pos, final String pattern) {
+        if (pos < 0) {
+            return false;
+        }
+
+        if (pattern != null) {
+            final int length = pattern.length();
+            if (length <= buffer.length() - pos) {
+                for (int i = 0; i < length; i++) {
+                    if (pattern.charAt(i) != buffer.charAt(pos + i)) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public boolean isLineCommentStarted(final CharSequence buffer, final int pos) {
+        if (lineCommentDelims != null) {
+            for (String comment: lineCommentDelims) {
+                if (isCommentDelim(buffer, pos, comment)) {
+                    return true;
                 }
             }
         }
@@ -347,10 +566,15 @@ public class DefaultParser implements Parser {
     private class BracketChecker {
         private int missingOpeningBracket = -1;
         private List<Integer> nested = new ArrayList<>();
+        private int openBrackets = 0;
+        private int cursor;
+        private String nextClosingBracket;
 
-        public BracketChecker(){}
+        public BracketChecker(int cursor) {
+            this.cursor = cursor;
+        }
 
-        public void check(final CharSequence buffer, final int pos){
+        public void check(final CharSequence buffer, final int pos) {
             if (openingBrackets == null || pos < 0) {
                 return;
             }
@@ -367,24 +591,30 @@ public class DefaultParser implements Parser {
                     }
                 }
             }
+            if (cursor > pos) {
+                openBrackets = nested.size();
+                if (nested.size() > 0) {
+                    nextClosingBracket = String.valueOf(closingBrackets[nested.get(nested.size() - 1)]);
+                }
+            }
         }
 
-        public boolean isOpeningBracketMissing(){
+        public boolean isOpeningBracketMissing() {
             return missingOpeningBracket != -1;
         }
 
-        public String getMissingOpeningBracket(){
+        public String getMissingOpeningBracket() {
             if (!isOpeningBracketMissing()) {
                 return null;
             }
             return Character.toString(openingBrackets[missingOpeningBracket]);
         }
 
-        public boolean isClosingBracketMissing(){
+        public boolean isClosingBracketMissing() {
             return !nested.isEmpty();
         }
 
-        public String getMissingClosingBrackets(){
+        public String getMissingClosingBrackets() {
             if (!isClosingBracketMissing()) {
                 return null;
             }
@@ -395,7 +625,15 @@ public class DefaultParser implements Parser {
             return out.toString();
         }
 
-        private int bracketId(final char[] brackets, final CharSequence buffer, final int pos){
+        public int getOpenBrackets() {
+            return openBrackets;
+        }
+
+        public String getNextClosingBracket() {
+            return nested.size() == 2 ? nextClosingBracket : null;
+        }
+
+        private int bracketId(final char[] brackets, final CharSequence buffer, final int pos) {
             for (int i=0; i < brackets.length; i++) {
                 if (buffer.charAt(pos) == brackets[i]) {
                     return i;
@@ -503,25 +741,28 @@ public class DefaultParser implements Parser {
                 }
             }
             if (escapeChars != null) {
-                // Completion is protected by an opening quote:
-                // Delimiters (spaces) don't need to be escaped, nor do other quotes, but everything else does.
-                // Also, close the quote at the end
-                if (openingQuote != null) {
-                    needToBeEscaped = i -> isRawEscapeChar(sb.charAt(i)) || String.valueOf(sb.charAt(i)).equals(openingQuote);
-                }
-                // Completion is protected by middle quotes:
-                // Delimiters (spaces) don't need to be escaped, nor do quotes, but everything else does.
-                else if (middleQuotes) {
-                    needToBeEscaped = i -> isRawEscapeChar(sb.charAt(i));
-                }
-                // No quote protection, need to escape everything: delimiter chars (spaces), quote chars
-                // and escapes themselves
-                else {
-                    needToBeEscaped = i -> isDelimiterChar(sb, i) || isRawEscapeChar(sb.charAt(i)) || isRawQuoteChar(sb.charAt(i));
-                }
-                for (int i = 0; i < sb.length(); i++) {
-                    if (needToBeEscaped.test(i)) {
-                        sb.insert(i++, escapeChars[0]);
+                if (escapeChars.length > 0) {
+                    // Completion is protected by an opening quote:
+                    // Delimiters (spaces) don't need to be escaped, nor do other quotes, but everything else does.
+                    // Also, close the quote at the end
+                    if (openingQuote != null) {
+                        needToBeEscaped = i -> isRawEscapeChar(sb.charAt(i)) || String.valueOf(sb.charAt(i)).equals(openingQuote);
+                    }
+                    // Completion is protected by middle quotes:
+                    // Delimiters (spaces) don't need to be escaped, nor do quotes, but everything else does.
+                    else if (middleQuotes) {
+                        needToBeEscaped = i -> isRawEscapeChar(sb.charAt(i));
+                    }
+                    // No quote protection, need to escape everything: delimiter chars (spaces), quote chars
+                    // and escapes themselves
+                    else {
+                        needToBeEscaped = i -> isDelimiterChar(sb, i) || isRawEscapeChar(sb.charAt(i))
+                                || isRawQuoteChar(sb.charAt(i));
+                    }
+                    for (int i = 0; i < sb.length(); i++) {
+                        if (needToBeEscaped.test(i)) {
+                            sb.insert(i++, escapeChars[0]);
+                        }
                     }
                 }
             } else if (openingQuote == null && !middleQuotes) {

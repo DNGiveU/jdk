@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,57 +25,37 @@
 
 package jdk.jfr.internal.consumer;
 
+import jdk.jfr.internal.LogLevel;
+import jdk.jfr.internal.LogTag;
+import jdk.jfr.internal.Logger;
+
 import jdk.jfr.internal.LongMap;
+import jdk.jfr.internal.Type;
 
 /**
  * Holds mapping between a set of keys and their corresponding object.
  *
- * If the type is a known type, i.e. {@link RecordedThread}, an
+ * If the type is a known type, i.e. {@link jdk.jfr.consumer.RecordedThread}, an
  * {@link ObjectFactory} can be supplied which will instantiate a typed object.
  */
 final class ConstantMap {
-
     private static final int RESOLUTION_FINISHED = 0;
     private static final int RESOLUTION_STARTED = 1;
     public static final ConstantMap EMPTY = new ConstantMap();
 
-    // A temporary placeholder, so objects can
-    // reference themselves (directly, or indirectly),
-    // when making a transition from numeric id references
-    // to normal Java references.
-    private final static class Reference {
-        private final long key;
-        private final ConstantMap pool;
-
-        Reference(ConstantMap pool, long key) {
-            this.pool = pool;
-            this.key = key;
-        }
-
-        Object resolve() {
-            return pool.get(key);
-        }
-
-        public String toString() {
-            return "ref: " + pool.name + "[" + key + "]";
-        }
-    }
-
     final ObjectFactory<?> factory;
-    final String name;
-
+    final Type type;
     private final LongMap<Object> objects;
-
     private boolean resolving;
     private boolean allResolved;
 
     private ConstantMap() {
-        this(null, "<empty>");
+        this(null, null);
         allResolved = true;
     }
 
-    ConstantMap(ObjectFactory<?> factory, String name) {
-        this.name = name;
+    ConstantMap(ObjectFactory<?> factory, Type type) {
+        this.type = type;
         this.objects = new LongMap<>(2);
         this.factory = factory;
     }
@@ -90,14 +70,14 @@ final class ConstantMap {
             return new Reference(this, id);
         }
 
-        // should always have a value
+        // should ideally always have a value
         Object value = objects.get(id);
         if (value == null) {
-            // unless is 0 which is used to represent null
-            if (id == 0) {
-                return null;
+            // unless id is 0 which is used to represent null
+            if (id != 0) {
+                Logger.log(LogTag.JFR_SYSTEM_PARSER, LogLevel.INFO, "Missing object id=" + id + " in pool " + getName() + ". All ids should reference an object");
             }
-            throw new InternalError("Missing object id=" + id + " in pool " + name + ". All ids should reference object");
+            return null;
         }
 
         // id is resolved (but not the whole pool)
@@ -133,8 +113,8 @@ final class ConstantMap {
     }
 
     private static Object resolve(Object o) {
-        if (o instanceof Reference) {
-            return resolve(((Reference) o).resolve());
+        if (o instanceof Reference r) {
+            return resolve(r.resolve());
         }
         if (o != null && o.getClass().isArray()) {
             final Object[] array = (Object[]) o;
@@ -152,6 +132,9 @@ final class ConstantMap {
     }
 
     public void put(long key, Object value) {
+        if (objects.hasKey(key)) {
+            objects.clearId(key);
+        }
         objects.put(key, value);
     }
 
@@ -166,7 +149,12 @@ final class ConstantMap {
     }
 
     public String getName() {
-        return name;
+        return type == null ? "<empty>" : type.getName();
+    }
+
+    // Can be null
+    public Type getType() {
+        return type;
     }
 
     public Object getResolved(long id) {
@@ -180,5 +168,9 @@ final class ConstantMap {
 
     public void setAllResolved(boolean allResolved) {
         this.allResolved = allResolved;
+    }
+
+    public LongMap<Object> getObjects() {
+       return objects;
     }
 }

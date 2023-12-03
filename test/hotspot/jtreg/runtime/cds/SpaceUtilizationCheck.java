@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -26,15 +26,15 @@
  * @summary Check if the space utilization for shared spaces is adequate
  * @requires vm.cds
  * @library /test/lib
- * @build sun.hotspot.WhiteBox
- * @run driver ClassFileInstaller sun.hotspot.WhiteBox
- *                              sun.hotspot.WhiteBox$WhiteBoxPermission
+ * @build jdk.test.whitebox.WhiteBox
+ * @run driver jdk.test.lib.helpers.ClassFileInstaller jdk.test.whitebox.WhiteBox
  * @run main/othervm -Xbootclasspath/a:. -XX:+UnlockDiagnosticVMOptions -XX:+WhiteBoxAPI SpaceUtilizationCheck
  */
 
 import jdk.test.lib.cds.CDSTestUtils;
+import jdk.test.lib.cds.CDSOptions;
 import jdk.test.lib.process.OutputAnalyzer;
-import sun.hotspot.WhiteBox;
+import jdk.test.whitebox.WhiteBox;
 
 import java.util.regex.Pattern;
 import java.util.regex.Matcher;
@@ -43,43 +43,44 @@ import java.util.Hashtable;
 import java.lang.Integer;
 
 public class SpaceUtilizationCheck {
+    // For the RW/RO regions:
     // [1] Each region must have strictly less than
-    //     WhiteBox.metaspaceReserveAlignment() bytes of unused space.
+    //     WhiteBox.metaspaceSharedRegionAlignment() bytes of unused space.
     // [2] There must be no gap between two consecutive regions.
 
     public static void main(String[] args) throws Exception {
-        // (1) Default VM arguments
-        test();
-
-        // (2) Use the now deprecated VM arguments. They should have no effect.
-        test("-XX:SharedReadWriteSize=128M",
-             "-XX:SharedReadOnlySize=128M",
-             "-XX:SharedMiscDataSize=128M",
-             "-XX:SharedMiscCodeSize=128M");
+        test("-Xlog:cds=debug");
     }
 
     static void test(String... extra_options) throws Exception {
-        OutputAnalyzer output = CDSTestUtils.createArchive(extra_options);
-        CDSTestUtils.checkDump(output);
-        Pattern pattern = Pattern.compile("^(..) *space: *([0-9]+).* out of *([0-9]+) bytes .* at 0x([0-9a0-f]+)");
+        CDSOptions opts = new CDSOptions();
+        opts.addSuffix(extra_options);
+        OutputAnalyzer output = CDSTestUtils.createArchiveAndCheck(opts);
+        Pattern pattern = Pattern.compile("(..) space: *([0-9]+).* out of *([0-9]+) bytes .* at 0x([0-9a0-f]+)");
         WhiteBox wb = WhiteBox.getWhiteBox();
-        long reserve_alignment = wb.metaspaceReserveAlignment();
-        System.out.println("Metaspace::reserve_alignment() = " + reserve_alignment);
+        long reserve_alignment = wb.metaspaceSharedRegionAlignment();
+        System.out.println("MetaspaceShared::core_region_alignment() = " + reserve_alignment);
+
+        // Look for output like this. The pattern will only match the first 2 regions, which is what we need to check
+        //
+        // [0.938s][debug][cds] rw space:   5253952 [ 35.2% of total] out of   5255168 bytes [100.0% used] at 0x0000000800000000
+        // [0.938s][debug][cds] ro space:   8353976 [ 55.9% of total] out of   8355840 bytes [100.0% used] at 0x0000000800503000
+        // [0.938s][debug][cds] bm space:    262232 [  1.8% of total] out of    262232 bytes [100.0% used]
+        // [0.938s][debug][cds] hp space:   1057712 [  7.1% of total] out of   1057712 bytes [100.0% used] at 0x00007fa24c180090
+        // [0.938s][debug][cds] total   :  14927872 [100.0% of total] out of  14934960 bytes [100.0% used]
 
         long last_region = -1;
         Hashtable<String,String> checked = new Hashtable<>();
         for (String line : output.getStdout().split("\n")) {
-            if (line.contains(" space:") && !line.contains("st space:")) {
+            if (line.contains(" space:")) {
                 Matcher matcher = pattern.matcher(line);
                 if (matcher.find()) {
                     String name = matcher.group(1);
-                    if (name.equals("bm")) {
-                      // Bitmap space does not have a requested address.
-                      break;
-                    } else {
-                      System.out.println("Checking " + name + " in : " + line);
-                      checked.put(name, name);
+                    if (!name.equals("rw") && ! name.equals("ro")) {
+                        continue;
                     }
+                    System.out.println("Checking " + name + " in : " + line);
+                    checked.put(name, name);
                     long used = Long.parseLong(matcher.group(2));
                     long capacity = Long.parseLong(matcher.group(3));
                     long address = Long.parseLong(matcher.group(4), 16);
@@ -89,7 +90,7 @@ public class SpaceUtilizationCheck {
                     }
                     if (unused > reserve_alignment) {
                         // [1] Check for unused space
-                        throw new RuntimeException("Unused space (" + unused + ") must be smaller than Metaspace::reserve_alignment() (" +
+                        throw new RuntimeException("Unused space (" + unused + ") must be smaller than MetaspaceShared::core_region_alignment() (" +
                                                    reserve_alignment + ")");
                     }
                     if (last_region >= 0 && address != last_region) {
@@ -100,8 +101,8 @@ public class SpaceUtilizationCheck {
                 }
             }
         }
-        if (checked.size() != 4) {
-          throw new RuntimeException("Must have 4 consecutive, fully utilized regions");
+        if (checked.size() != 2) {
+          throw new RuntimeException("Must have 2 consecutive, fully utilized regions"); // RW,RO
         }
     }
 }

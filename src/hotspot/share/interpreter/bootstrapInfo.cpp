@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2019, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -23,19 +23,24 @@
  */
 
 #include "precompiled.hpp"
-#include "jvm.h"
 #include "classfile/javaClasses.inline.hpp"
 #include "classfile/resolutionErrors.hpp"
+#include "classfile/systemDictionary.hpp"
+#include "classfile/vmClasses.hpp"
 #include "interpreter/bootstrapInfo.hpp"
 #include "interpreter/linkResolver.hpp"
+#include "jvm.h"
 #include "logging/log.hpp"
 #include "logging/logStream.hpp"
 #include "memory/oopFactory.hpp"
+#include "memory/resourceArea.hpp"
+#include "oops/constantPool.inline.hpp"
 #include "oops/cpCache.inline.hpp"
 #include "oops/objArrayOop.inline.hpp"
+#include "oops/resolvedIndyEntry.hpp"
 #include "oops/typeArrayOop.inline.hpp"
 #include "runtime/handles.inline.hpp"
-#include "runtime/thread.inline.hpp"
+#include "runtime/javaThread.hpp"
 #include "runtime/vmThread.hpp"
 
 //------------------------------------------------------------------------------------------------------------------------
@@ -52,7 +57,7 @@ BootstrapInfo::BootstrapInfo(const constantPoolHandle& pool, int bss_index, int 
 {
   _is_resolved = false;
   assert(pool->tag_at(bss_index).has_bootstrap(), "");
-  assert(indy_index == -1 || pool->invokedynamic_bootstrap_ref_index_at(indy_index) == bss_index, "invalid bootstrap specifier index");
+  assert(indy_index == -1 || pool->resolved_indy_entry_at(indy_index)->constant_pool_index() == bss_index, "invalid bootstrap specifier index");
 }
 
 // If there is evidence this call site was already linked, set the
@@ -60,16 +65,17 @@ BootstrapInfo::BootstrapInfo(const constantPoolHandle& pool, int bss_index, int 
 // Return true if either action is taken, else false.
 bool BootstrapInfo::resolve_previously_linked_invokedynamic(CallInfo& result, TRAPS) {
   assert(_indy_index != -1, "");
-  ConstantPoolCacheEntry* cpce = invokedynamic_cp_cache_entry();
-  if (!cpce->is_f1_null()) {
-    methodHandle method(     THREAD, cpce->f1_as_method());
-    Handle       appendix(   THREAD, cpce->appendix_if_resolved(_pool));
-    result.set_handle(method, appendix, THREAD);
-    Exceptions::wrap_dynamic_exception(CHECK_false);
+  // Check if method is not null
+  ResolvedIndyEntry* indy_entry = _pool->resolved_indy_entry_at(_indy_index);
+  if (indy_entry->method() != nullptr) {
+    methodHandle method(THREAD, indy_entry->method());
+    Handle appendix(THREAD, _pool->resolved_reference_from_indy(_indy_index));
+    result.set_handle(vmClasses::MethodHandle_klass(), method, appendix, THREAD);
+    Exceptions::wrap_dynamic_exception(/* is_indy */ true, CHECK_false);
     return true;
-  } else if (cpce->indy_resolution_failed()) {
-    int encoded_index = ResolutionErrorTable::encode_cpcache_index(_indy_index);
-    ConstantPool::throw_resolution_error(_pool, encoded_index, CHECK_false);
+  } else if (indy_entry->resolution_failed()) {
+    int encoded_index = ResolutionErrorTable::encode_indy_index(ConstantPool::encode_invokedynamic_index(_indy_index));
+    ConstantPool::throw_resolution_error(_pool, encoded_index, CHECK_false); // Doesn't necessarily need to be resolved yet
     return true;
   } else {
     return false;
@@ -81,24 +87,28 @@ bool BootstrapInfo::resolve_previously_linked_invokedynamic(CallInfo& result, TR
 // - obtain the NameAndType description for the condy/indy
 // - prepare the BSM's static arguments
 Handle BootstrapInfo::resolve_bsm(TRAPS) {
-  if (_bsm.not_null())  return _bsm;
+  if (_bsm.not_null()) {
+    return _bsm;
+  }
+
+  bool is_indy = is_method_call();
   // The tag at the bootstrap method index must be a valid method handle or a method handle in error.
   // If it is a MethodHandleInError, a resolution error will be thrown which will be wrapped if necessary
   // with a BootstrapMethodError.
   assert(_pool->tag_at(bsm_index()).is_method_handle() ||
          _pool->tag_at(bsm_index()).is_method_handle_in_error(), "MH not present, classfile structural constraint");
   oop bsm_oop = _pool->resolve_possibly_cached_constant_at(bsm_index(), THREAD);
-  Exceptions::wrap_dynamic_exception(CHECK_NH);
+  Exceptions::wrap_dynamic_exception(is_indy, CHECK_NH);
   guarantee(java_lang_invoke_MethodHandle::is_instance(bsm_oop), "classfile must supply a valid BSM");
   _bsm = Handle(THREAD, bsm_oop);
 
   // Obtain NameAndType information
   resolve_bss_name_and_type(THREAD);
-  Exceptions::wrap_dynamic_exception(CHECK_NH);
+  Exceptions::wrap_dynamic_exception(is_indy, CHECK_NH);
 
   // Prepare static arguments
   resolve_args(THREAD);
-  Exceptions::wrap_dynamic_exception(CHECK_NH);
+  Exceptions::wrap_dynamic_exception(is_indy, CHECK_NH);
 
   return _bsm;
 }
@@ -178,12 +188,12 @@ void BootstrapInfo::resolve_args(TRAPS) {
 
   if (!use_BSCI) {
     // return {arg...}; resolution of arguments is done immediately, before JDK code is called
-    objArrayOop args_oop = oopFactory::new_objArray(SystemDictionary::Object_klass(), _argc, CHECK);
+    objArrayOop args_oop = oopFactory::new_objArray(vmClasses::Object_klass(), _argc, CHECK);
     objArrayHandle args(THREAD, args_oop);
     _pool->copy_bootstrap_arguments_at(_bss_index, 0, _argc, args, 0, true, Handle(), CHECK);
-    oop arg_oop = ((_argc == 1) ? args->obj_at(0) : (oop)NULL);
+    oop arg_oop = ((_argc == 1) ? args->obj_at(0) : (oop)nullptr);
     // try to discard the singleton array
-    if (arg_oop != NULL && !arg_oop->is_array()) {
+    if (arg_oop != nullptr && !arg_oop->is_array()) {
       // JVM treats arrays and nulls specially in this position,
       // but other things are just single arguments
       _arg_values = Handle(THREAD, arg_oop);
@@ -203,18 +213,17 @@ void BootstrapInfo::resolve_args(TRAPS) {
 bool BootstrapInfo::save_and_throw_indy_exc(TRAPS) {
   assert(HAS_PENDING_EXCEPTION, "");
   assert(_indy_index != -1, "");
-  ConstantPoolCacheEntry* cpce = invokedynamic_cp_cache_entry();
-  int encoded_index = ResolutionErrorTable::encode_cpcache_index(_indy_index);
-  bool recorded_res_status = cpce->save_and_throw_indy_exc(_pool, _bss_index,
-                                                           encoded_index,
-                                                           pool()->tag_at(_bss_index),
-                                                           CHECK_false);
+  assert(_indy_index >= 0, "Indy index must be decoded by now");
+  bool recorded_res_status = _pool->cache()->save_and_throw_indy_exc(_pool, _bss_index,
+                                                                     _indy_index,
+                                                                     pool()->tag_at(_bss_index),
+                                                                     CHECK_false);
   return recorded_res_status;
 }
 
 void BootstrapInfo::resolve_newly_linked_invokedynamic(CallInfo& result, TRAPS) {
   assert(is_resolved(), "");
-  result.set_handle(resolved_method(), resolved_appendix(), CHECK);
+  result.set_handle(vmClasses::MethodHandle_klass(), resolved_method(), resolved_appendix(), CHECK);
 }
 
 void BootstrapInfo::print_msg_on(outputStream* st, const char* msg) {
@@ -222,11 +231,12 @@ void BootstrapInfo::print_msg_on(outputStream* st, const char* msg) {
   char what[20];
   st = st ? st : tty;
 
-  if (_indy_index != -1)
-    sprintf(what, "indy#%d", decode_indy_index());
-  else
-    sprintf(what, "condy");
-  bool have_msg = (msg != NULL && strlen(msg) > 0);
+  if (_indy_index > -1) {
+    os::snprintf_checked(what, sizeof(what), "indy#%d", _indy_index);
+  } else {
+    os::snprintf_checked(what, sizeof(what), "condy");
+  }
+  bool have_msg = (msg != nullptr && strlen(msg) > 0);
   st->print_cr("%s%sBootstrap in %s %s@CP[%d] %s:%s%s BSMS[%d] BSM@CP[%d]%s argc=%d%s",
                 (have_msg ? msg : ""), (have_msg ? " " : ""),
                 caller()->name()->as_C_string(),
@@ -244,16 +254,16 @@ void BootstrapInfo::print_msg_on(outputStream* st, const char* msg) {
     for (int i = 0; i < _argc; i++) {
       int pos = (int) strlen(argbuf);
       if (pos + 20 > (int)sizeof(argbuf)) {
-        sprintf(argbuf + pos, "...");
+        os::snprintf_checked(argbuf + pos, sizeof(argbuf) - pos, "...");
         break;
       }
       if (i > 0)  argbuf[pos++] = ',';
-      sprintf(argbuf+pos, "%d", arg_index(i));
+      os::snprintf_checked(argbuf+pos, sizeof(argbuf) - pos, "%d", arg_index(i));
     }
     st->print_cr("  argument indexes: {%s}", argbuf);
   }
   if (_bsm.not_null()) {
-    st->print("  resolved BSM: "); _bsm->print();
+    st->print("  resolved BSM: "); _bsm->print_on(st);
   }
 
   // How the array of resolved arguments is printed depends highly
@@ -264,17 +274,17 @@ void BootstrapInfo::print_msg_on(outputStream* st, const char* msg) {
     objArrayOop static_args = (objArrayOop)_arg_values();
     if (!static_args->is_array()) {
       assert(_argc == 1, "Invalid BSM _arg_values for non-array");
-      st->print("  resolved arg[0]: "); static_args->print();
+      st->print("  resolved arg[0]: "); static_args->print_on(st);
     } else if (static_args->is_objArray()) {
       int lines = 0;
       for (int i = 0; i < _argc; i++) {
         oop x = static_args->obj_at(i);
-        if (x != NULL) {
+        if (x != nullptr) {
           if (++lines > 6) {
             st->print_cr("  resolved arg[%d]: ...", i);
             break;
           }
-          st->print("  resolved arg[%d]: ", i); x->print();
+          st->print("  resolved arg[%d]: ", i); x->print_on(st);
         }
       }
     } else if (static_args->is_typeArray()) {

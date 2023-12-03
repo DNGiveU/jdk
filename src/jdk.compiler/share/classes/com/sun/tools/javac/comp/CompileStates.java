@@ -59,9 +59,11 @@ public class CompileStates extends HashMap<Env<AttrContext>, CompileStates.Compi
         ATTR(4),
         FLOW(5),
         TRANSTYPES(6),
-        UNLAMBDA(7),
-        LOWER(8),
-        GENERATE(9);
+        TRANSLITERALS(7),
+        TRANSPATTERNS(8),
+        UNLAMBDA(9),
+        LOWER(10),
+        GENERATE(11);
 
         CompileState(int value) {
             this.value = value;
@@ -79,6 +81,7 @@ public class CompileStates extends HashMap<Env<AttrContext>, CompileStates.Compi
 
     protected transient Context context;
 
+    @SuppressWarnings("this-escape")
     public CompileStates(Context context) {
         this.context = context;
         context.put(compileStatesKey, this);

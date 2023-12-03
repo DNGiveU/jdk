@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2017, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2017, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -21,7 +21,7 @@
  * questions.
  */
 
-import sun.hotspot.code.Compiler;
+import jdk.test.whitebox.code.Compiler;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -29,17 +29,16 @@ import java.util.Map;
 import java.util.HashMap;
 import jdk.test.lib.apps.LingeredApp;
 import jtreg.SkippedException;
-import sun.hotspot.gc.GC;
+import jdk.test.whitebox.gc.GC;
 
 /**
  * @test
  * @summary Test the 'universe' command of jhsdb clhsdb.
- * @requires vm.hasSAandCanAttach
+ * @requires vm.hasSA
  * @bug 8190307
  * @library /test/lib
- * @build jdk.test.lib.apps.*
- * @build sun.hotspot.WhiteBox
- * @run driver ClassFileInstaller sun.hotspot.WhiteBox sun.hotspot.WhiteBox$WhiteBoxPermission
+ * @build jdk.test.whitebox.WhiteBox
+ * @run driver jdk.test.lib.helpers.ClassFileInstaller jdk.test.whitebox.WhiteBox
  * @run main/othervm -XX:+UnlockDiagnosticVMOptions -XX:+WhiteBoxAPI -Xbootclasspath/a:. TestUniverse
  */
 
@@ -93,7 +92,7 @@ public class TestUniverse {
     private static void test(GC gc) throws Exception {
         LingeredApp app = null;
         try {
-            app = LingeredApp.startApp(List.of("-XX:+UnlockExperimentalVMOptions", "-XX:+Use" + gc + "GC"));
+            app = LingeredApp.startApp("-XX:+UnlockExperimentalVMOptions", "-XX:+Use" + gc + "GC");
             System.out.println ("Started LingeredApp with " + gc + "GC and pid " + app.getPid());
             testClhsdbForUniverse(app.getPid(), gc);
         } finally {

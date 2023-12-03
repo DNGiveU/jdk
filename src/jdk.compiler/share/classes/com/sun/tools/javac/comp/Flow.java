@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1999, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1999, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -27,14 +27,17 @@
 
 package com.sun.tools.javac.comp;
 
+import java.util.Map;
+import java.util.Map.Entry;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.function.Consumer;
 
+import com.sun.source.tree.CaseTree;
 import com.sun.source.tree.LambdaExpressionTree.BodyKind;
 import com.sun.tools.javac.code.*;
 import com.sun.tools.javac.code.Scope.WriteableScope;
-import com.sun.tools.javac.code.Source.Feature;
 import com.sun.tools.javac.resources.CompilerProperties.Errors;
 import com.sun.tools.javac.resources.CompilerProperties.Warnings;
 import com.sun.tools.javac.tree.*;
@@ -48,10 +51,22 @@ import com.sun.tools.javac.tree.JCTree.*;
 
 import static com.sun.tools.javac.code.Flags.*;
 import static com.sun.tools.javac.code.Flags.BLOCK;
+import com.sun.tools.javac.code.Kinds.Kind;
 import static com.sun.tools.javac.code.Kinds.Kind.*;
+import com.sun.tools.javac.code.Type.TypeVar;
 import static com.sun.tools.javac.code.TypeTag.BOOLEAN;
 import static com.sun.tools.javac.code.TypeTag.VOID;
+import com.sun.tools.javac.resources.CompilerProperties.Fragments;
 import static com.sun.tools.javac.tree.JCTree.Tag.*;
+import com.sun.tools.javac.util.JCDiagnostic.Fragment;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.IdentityHashMap;
+import java.util.Iterator;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+import static java.util.stream.Collectors.groupingBy;
 
 /** This pass implements dataflow analysis for Java programs though
  *  different AST visitor steps. Liveness analysis (see AliveAnalyzer) checks that
@@ -136,7 +151,7 @@ import static com.sun.tools.javac.tree.JCTree.Tag.*;
  *  return statement" iff V is DA before the return statement or V is
  *  DA at the end of any intervening finally block.  Note that we
  *  don't have to worry about the return expression because this
- *  concept is only used for construcrors.
+ *  concept is only used for constructors.
  *
  *  <p>There is no spec in the JLS for when a variable is definitely
  *  assigned at the end of a constructor, which is needed for final
@@ -202,7 +217,7 @@ public class Flow {
     private final JCDiagnostic.Factory diags;
     private Env<AttrContext> attrEnv;
     private       Lint lint;
-    private final boolean allowEffectivelyFinalInInnerClasses;
+    private final Infer infer;
 
     public static Flow instance(Context context) {
         Flow instance = context.get(flowKey);
@@ -216,13 +231,14 @@ public class Flow {
         new AssignAnalyzer().analyzeTree(env, make);
         new FlowAnalyzer().analyzeTree(env, make);
         new CaptureAnalyzer().analyzeTree(env, make);
+        new ThisEscapeAnalyzer(names, syms, types, log, lint).analyzeTree(env);
     }
 
     public void analyzeLambda(Env<AttrContext> env, JCLambda that, TreeMaker make, boolean speculative) {
         Log.DiagnosticHandler diagHandler = null;
         //we need to disable diagnostics temporarily; the problem is that if
         //a lambda expression contains e.g. an unreachable statement, an error
-        //message will be reported and will cause compilation to skip the flow analyis
+        //message will be reported and will cause compilation to skip the flow analysis
         //step - if we suppress diagnostics, we won't stop at Attr for flow-analysis
         //related errors, which will allow for more errors to be detected
         if (!speculative) {
@@ -241,7 +257,7 @@ public class Flow {
             JCLambda that, TreeMaker make) {
         //we need to disable diagnostics temporarily; the problem is that if
         //a lambda expression contains e.g. an unreachable statement, an error
-        //message will be reported and will cause compilation to skip the flow analyis
+        //message will be reported and will cause compilation to skip the flow analysis
         //step - if we suppress diagnostics, we won't stop at Attr for flow-analysis
         //related errors, which will allow for more errors to be detected
         Log.DiagnosticHandler diagHandler = new Log.DiscardDiagnosticHandler(log);
@@ -250,6 +266,40 @@ public class Flow {
             LambdaFlowAnalyzer flowAnalyzer = new LambdaFlowAnalyzer();
             flowAnalyzer.analyzeTree(env, that, make);
             return flowAnalyzer.inferredThrownTypes;
+        } finally {
+            log.popDiagnosticHandler(diagHandler);
+        }
+    }
+
+    public boolean aliveAfter(Env<AttrContext> env, JCTree that, TreeMaker make) {
+        //we need to disable diagnostics temporarily; the problem is that if
+        //"that" contains e.g. an unreachable statement, an error
+        //message will be reported and will cause compilation to skip the flow analysis
+        //step - if we suppress diagnostics, we won't stop at Attr for flow-analysis
+        //related errors, which will allow for more errors to be detected
+        Log.DiagnosticHandler diagHandler = new Log.DiscardDiagnosticHandler(log);
+        try {
+            SnippetAliveAnalyzer analyzer = new SnippetAliveAnalyzer();
+
+            analyzer.analyzeTree(env, that, make);
+            return analyzer.isAlive();
+        } finally {
+            log.popDiagnosticHandler(diagHandler);
+        }
+    }
+
+    public boolean breaksToTree(Env<AttrContext> env, JCTree breakTo, JCTree body, TreeMaker make) {
+        //we need to disable diagnostics temporarily; the problem is that if
+        //"that" contains e.g. an unreachable statement, an error
+        //message will be reported and will cause compilation to skip the flow analysis
+        //step - if we suppress diagnostics, we won't stop at Attr for flow-analysis
+        //related errors, which will allow for more errors to be detected
+        Log.DiagnosticHandler diagHandler = new Log.DiscardDiagnosticHandler(log);
+        try {
+            SnippetBreakToAnalyzer analyzer = new SnippetBreakToAnalyzer(breakTo);
+
+            analyzer.analyzeTree(env, body, make);
+            return analyzer.breaksTo();
         } finally {
             log.popDiagnosticHandler(diagHandler);
         }
@@ -282,6 +332,7 @@ public class Flow {
         }
     }
 
+    @SuppressWarnings("this-escape")
     protected Flow(Context context) {
         context.put(flowKey, this);
         names = Names.instance(context);
@@ -290,17 +341,17 @@ public class Flow {
         types = Types.instance(context);
         chk = Check.instance(context);
         lint = Lint.instance(context);
+        infer = Infer.instance(context);
         rs = Resolve.instance(context);
         diags = JCDiagnostic.Factory.instance(context);
         Source source = Source.instance(context);
-        allowEffectivelyFinalInInnerClasses = Feature.EFFECTIVELY_FINAL_IN_INNER_CLASSES.allowedInSource(source);
     }
 
     /**
      * Base visitor class for all visitors implementing dataflow analysis logic.
      * This class define the shared logic for handling jumps (break/continue statements).
      */
-    static abstract class BaseAnalyzer extends TreeScanner {
+    abstract static class BaseAnalyzer extends TreeScanner {
 
         enum JumpKind {
             BREAK(JCTree.Tag.BREAK) {
@@ -335,6 +386,13 @@ public class Flow {
          *  to an enclosing block, in source order.
          */
         ListBuffer<PendingExit> pendingExits;
+
+        /** A class whose initializers we are scanning. Because initializer
+         *  scans can be triggered out of sequence when visiting certain nodes
+         *  (e.g., super()), we protect against infinite loops that could be
+         *  triggered by incorrect code (e.g., super() inside initializer).
+         */
+        JCClassDecl initScanClass;
 
         /** A pending exit.  These are the statements return, break, and
          *  continue.  In addition, exception-throwing expressions or
@@ -421,6 +479,24 @@ public class Flow {
                 scan(brk);
             }
         }
+
+        // Do something with all static or non-static field initializers and initialization blocks.
+        // Note: This method also sends nested class definitions to the handler.
+        protected void forEachInitializer(JCClassDecl classDef, boolean isStatic, Consumer<? super JCTree> handler) {
+            if (classDef == initScanClass)          // avoid infinite loops
+                return;
+            JCClassDecl initScanClassPrev = initScanClass;
+            initScanClass = classDef;
+            try {
+                for (List<JCTree> defs = classDef.defs; defs.nonEmpty(); defs = defs.tail) {
+                    JCTree def = defs.head;
+                    if (!def.hasTag(METHODDEF) && ((TreeInfo.flags(def) & STATIC) != 0) == isStatic)
+                        handler.accept(def);
+                }
+            } finally {
+                initScanClass = initScanClassPrev;
+            }
+        }
     }
 
     /**
@@ -486,20 +562,16 @@ public class Flow {
 
             try {
                 // process all the static initializers
-                for (List<JCTree> l = tree.defs; l.nonEmpty(); l = l.tail) {
-                    if (!l.head.hasTag(METHODDEF) &&
-                        (TreeInfo.flags(l.head) & STATIC) != 0) {
-                        scanDef(l.head);
-                    }
-                }
+                forEachInitializer(tree, true, def -> {
+                    scanDef(def);
+                    clearPendingExits(false);
+                });
 
                 // process all the instance initializers
-                for (List<JCTree> l = tree.defs; l.nonEmpty(); l = l.tail) {
-                    if (!l.head.hasTag(METHODDEF) &&
-                        (TreeInfo.flags(l.head) & STATIC) == 0) {
-                        scanDef(l.head);
-                    }
-                }
+                forEachInitializer(tree, false, def -> {
+                    scanDef(def);
+                    clearPendingExits(false);
+                });
 
                 // process all the methods
                 for (List<JCTree> l = tree.defs; l.nonEmpty(); l = l.tail) {
@@ -525,20 +597,25 @@ public class Flow {
             try {
                 alive = Liveness.ALIVE;
                 scanStat(tree.body);
+                tree.completesNormally = alive != Liveness.DEAD;
 
                 if (alive == Liveness.ALIVE && !tree.sym.type.getReturnType().hasTag(VOID))
                     log.error(TreeInfo.diagEndPos(tree.body), Errors.MissingRetStmt);
 
-                List<PendingExit> exits = pendingExits.toList();
-                pendingExits = new ListBuffer<>();
-                while (exits.nonEmpty()) {
-                    PendingExit exit = exits.head;
-                    exits = exits.tail;
-                    Assert.check(exit.tree.hasTag(RETURN) ||
-                                    log.hasErrorOn(exit.tree.pos()));
-                }
+                clearPendingExits(true);
             } finally {
                 lint = lintPrev;
+            }
+        }
+
+        private void clearPendingExits(boolean inMethod) {
+            List<PendingExit> exits = pendingExits.toList();
+            pendingExits = new ListBuffer<>();
+            while (exits.nonEmpty()) {
+                PendingExit exit = exits.head;
+                exits = exits.tail;
+                Assert.check((inMethod && exit.tree.hasTag(RETURN)) ||
+                                log.hasErrorOn(exit.tree.pos()));
             }
         }
 
@@ -618,19 +695,14 @@ public class Flow {
             ListBuffer<PendingExit> prevPendingExits = pendingExits;
             pendingExits = new ListBuffer<>();
             scan(tree.selector);
-            boolean hasDefault = false;
+            boolean exhaustiveSwitch = TreeInfo.expectedExhaustive(tree);
             for (List<JCCase> l = tree.cases; l.nonEmpty(); l = l.tail) {
                 alive = Liveness.ALIVE;
                 JCCase c = l.head;
-                if (c.pats.isEmpty())
-                    hasDefault = true;
-                else {
-                    for (JCExpression pat : c.pats) {
-                        scan(pat);
-                    }
+                for (JCCaseLabel pat : c.labels) {
+                    scan(pat);
                 }
                 scanStats(c.stats);
-                c.completesNormally = alive != Liveness.DEAD;
                 if (alive != Liveness.DEAD && c.caseKind == JCCase.RULE) {
                     scanSyntheticBreak(make, tree);
                     alive = Liveness.DEAD;
@@ -643,7 +715,15 @@ public class Flow {
                                 l.tail.head.pos(),
                                 Warnings.PossibleFallThroughIntoCase);
             }
-            if (!hasDefault) {
+            tree.isExhaustive = tree.hasUnconditionalPattern ||
+                                TreeInfo.isErrorEnumSwitch(tree.selector, tree.cases);
+            if (exhaustiveSwitch) {
+                tree.isExhaustive |= exhausts(tree.selector, tree.cases);
+                if (!tree.isExhaustive) {
+                    log.error(tree, Errors.NotExhaustiveStatement);
+                }
+            }
+            if (!tree.hasUnconditionalPattern && !exhaustiveSwitch) {
                 alive = Liveness.ALIVE;
             }
             alive = alive.or(resolveBreaks(tree, prevPendingExits));
@@ -654,30 +734,12 @@ public class Flow {
             ListBuffer<PendingExit> prevPendingExits = pendingExits;
             pendingExits = new ListBuffer<>();
             scan(tree.selector);
-            Set<Object> constants = null;
-            if ((tree.selector.type.tsym.flags() & ENUM) != 0) {
-                constants = new HashSet<>();
-                for (Symbol s : tree.selector.type.tsym.members().getSymbols(s -> (s.flags() & ENUM) != 0)) {
-                    constants.add(s.name);
-                }
-            }
-            boolean hasDefault = false;
             Liveness prevAlive = alive;
             for (List<JCCase> l = tree.cases; l.nonEmpty(); l = l.tail) {
                 alive = Liveness.ALIVE;
                 JCCase c = l.head;
-                if (c.pats.isEmpty())
-                    hasDefault = true;
-                else {
-                    for (JCExpression pat : c.pats) {
-                        scan(pat);
-                        if (constants != null) {
-                            if (pat.hasTag(IDENT))
-                                constants.remove(((JCIdent) pat).name);
-                            if (pat.type != null)
-                                constants.remove(pat.type.constValue());
-                        }
-                    }
+                for (JCCaseLabel pat : c.labels) {
+                    scan(pat);
                 }
                 scanStats(c.stats);
                 if (alive == Liveness.ALIVE) {
@@ -689,24 +751,391 @@ public class Flow {
                                   Errors.SwitchExpressionCompletesNormally);
                     }
                 }
-                c.completesNormally = alive != Liveness.DEAD;
             }
-            if ((constants == null || !constants.isEmpty()) && !hasDefault) {
+            tree.isExhaustive = tree.hasUnconditionalPattern ||
+                                TreeInfo.isErrorEnumSwitch(tree.selector, tree.cases) ||
+                                exhausts(tree.selector, tree.cases);
+            if (!tree.isExhaustive) {
                 log.error(tree, Errors.NotExhaustive);
             }
             alive = prevAlive;
             alive = alive.or(resolveYields(tree, prevPendingExits));
         }
 
+        private boolean exhausts(JCExpression selector, List<JCCase> cases) {
+            Set<PatternDescription> patternSet = new HashSet<>();
+            Map<Symbol, Set<Symbol>> enum2Constants = new HashMap<>();
+            for (JCCase c : cases) {
+                if (!TreeInfo.unguardedCase(c))
+                    continue;
+
+                for (var l : c.labels) {
+                    if (l instanceof JCPatternCaseLabel patternLabel) {
+                        for (Type component : components(selector.type)) {
+                            patternSet.add(makePatternDescription(component, patternLabel.pat));
+                        }
+                    } else if (l instanceof JCConstantCaseLabel constantLabel) {
+                        Symbol s = TreeInfo.symbol(constantLabel.expr);
+                        if (s != null && s.isEnum()) {
+                            enum2Constants.computeIfAbsent(s.owner, x -> {
+                                Set<Symbol> result = new HashSet<>();
+                                s.owner.members()
+                                       .getSymbols(sym -> sym.kind == Kind.VAR && sym.isEnum())
+                                       .forEach(result::add);
+                                return result;
+                            }).remove(s);
+                        }
+                    }
+                }
+            }
+            for (Entry<Symbol, Set<Symbol>> e : enum2Constants.entrySet()) {
+                if (e.getValue().isEmpty()) {
+                    patternSet.add(new BindingPattern(e.getKey().type));
+                }
+            }
+            Set<PatternDescription> patterns = patternSet;
+            try {
+                boolean repeat = true;
+                while (repeat) {
+                    Set<PatternDescription> updatedPatterns;
+                    updatedPatterns = reduceBindingPatterns(selector.type, patterns);
+                    updatedPatterns = reduceNestedPatterns(updatedPatterns);
+                    updatedPatterns = reduceRecordPatterns(updatedPatterns);
+                    updatedPatterns = removeCoveredRecordPatterns(updatedPatterns);
+                    repeat = !updatedPatterns.equals(patterns);
+                    patterns = updatedPatterns;
+                    if (checkCovered(selector.type, patterns)) {
+                        return true;
+                    }
+                }
+                return checkCovered(selector.type, patterns);
+            } catch (CompletionFailure cf) {
+                chk.completionError(selector.pos(), cf);
+                return true; //error recovery
+            }
+        }
+
+        private boolean checkCovered(Type seltype, Iterable<PatternDescription> patterns) {
+            for (Type seltypeComponent : components(seltype)) {
+                for (PatternDescription pd : patterns) {
+                    if (pd instanceof BindingPattern bp &&
+                        types.isSubtype(seltypeComponent, types.erasure(bp.type))) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        private List<Type> components(Type seltype) {
+            return switch (seltype.getTag()) {
+                case CLASS -> {
+                    if (seltype.isCompound()) {
+                        if (seltype.isIntersection()) {
+                            yield ((Type.IntersectionClassType) seltype).getComponents()
+                                                                        .stream()
+                                                                        .flatMap(t -> components(t).stream())
+                                                                        .collect(List.collector());
+                        }
+                        yield List.nil();
+                    }
+                    yield List.of(types.erasure(seltype));
+                }
+                case TYPEVAR -> components(((TypeVar) seltype).getUpperBound());
+                default -> List.of(types.erasure(seltype));
+            };
+        }
+
+        /* In a set of patterns, search for a sub-set of binding patterns that
+         * in combination exhaust their sealed supertype. If such a sub-set
+         * is found, it is removed, and replaced with a binding pattern
+         * for the sealed supertype.
+         */
+        private Set<PatternDescription> reduceBindingPatterns(Type selectorType, Set<PatternDescription> patterns) {
+            Set<Symbol> existingBindings = patterns.stream()
+                                                   .filter(pd -> pd instanceof BindingPattern)
+                                                   .map(pd -> ((BindingPattern) pd).type.tsym)
+                                                   .collect(Collectors.toSet());
+
+            for (PatternDescription pdOne : patterns) {
+                if (pdOne instanceof BindingPattern bpOne) {
+                    Set<PatternDescription> toAdd = new HashSet<>();
+
+                    for (Type sup : types.directSupertypes(bpOne.type)) {
+                        ClassSymbol clazz = (ClassSymbol) sup.tsym;
+
+                        clazz.complete();
+
+                        if (clazz.isSealed() && clazz.isAbstract() &&
+                            //if a binding pattern for clazz already exists, no need to analyze it again:
+                            !existingBindings.contains(clazz)) {
+                            ListBuffer<PatternDescription> bindings = new ListBuffer<>();
+                            //do not reduce to types unrelated to the selector type:
+                            Type clazzErasure = types.erasure(clazz.type);
+                            if (components(selectorType).stream()
+                                                        .map(types::erasure)
+                                                        .noneMatch(c -> types.isSubtype(clazzErasure, c))) {
+                                continue;
+                            }
+
+                            Set<Symbol> permitted = allPermittedSubTypes(clazz, csym -> {
+                                Type instantiated;
+                                if (csym.type.allparams().isEmpty()) {
+                                    instantiated = csym.type;
+                                } else {
+                                    instantiated = infer.instantiatePatternType(selectorType, csym);
+                                }
+
+                                return instantiated != null && types.isCastable(selectorType, instantiated);
+                            });
+
+                            for (PatternDescription pdOther : patterns) {
+                                if (pdOther instanceof BindingPattern bpOther) {
+                                    Set<Symbol> currentPermittedSubTypes =
+                                            allPermittedSubTypes((ClassSymbol) bpOther.type.tsym, s -> true);
+
+                                    PERMITTED: for (Iterator<Symbol> it = permitted.iterator(); it.hasNext();) {
+                                        Symbol perm = it.next();
+
+                                        for (Symbol currentPermitted : currentPermittedSubTypes) {
+                                            if (types.isSubtype(types.erasure(currentPermitted.type),
+                                                                types.erasure(perm.type))) {
+                                                it.remove();
+                                                continue PERMITTED;
+                                            }
+                                        }
+                                        if (types.isSubtype(types.erasure(perm.type),
+                                                            types.erasure(bpOther.type))) {
+                                            it.remove();
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (permitted.isEmpty()) {
+                                toAdd.add(new BindingPattern(clazz.type));
+                            }
+                        }
+                    }
+
+                    if (!toAdd.isEmpty()) {
+                        Set<PatternDescription> newPatterns = new HashSet<>(patterns);
+                        newPatterns.addAll(toAdd);
+                        return newPatterns;
+                    }
+                }
+            }
+            return patterns;
+        }
+
+        private Set<Symbol> allPermittedSubTypes(ClassSymbol root, Predicate<ClassSymbol> accept) {
+            Set<Symbol> permitted = new HashSet<>();
+            List<ClassSymbol> permittedSubtypesClosure = List.of(root);
+
+            while (permittedSubtypesClosure.nonEmpty()) {
+                ClassSymbol current = permittedSubtypesClosure.head;
+
+                permittedSubtypesClosure = permittedSubtypesClosure.tail;
+
+                current.complete();
+
+                if (current.isSealed() && current.isAbstract()) {
+                    for (Symbol sym : current.permitted) {
+                        ClassSymbol csym = (ClassSymbol) sym;
+
+                        if (accept.test(csym)) {
+                            permittedSubtypesClosure = permittedSubtypesClosure.prepend(csym);
+                            permitted.add(csym);
+                        }
+                    }
+                }
+            }
+
+            return permitted;
+        }
+
+        /* Among the set of patterns, find sub-set of patterns such:
+         * $record($prefix$, $nested, $suffix$)
+         * Where $record, $prefix$ and $suffix$ is the same for each pattern
+         * in the set, and the patterns only differ in one "column" in
+         * the $nested pattern.
+         * Then, the set of $nested patterns is taken, and passed recursively
+         * to reduceNestedPatterns and to reduceBindingPatterns, to
+         * simplify the pattern. If that succeeds, the original found sub-set
+         * of patterns is replaced with a new set of patterns of the form:
+         * $record($prefix$, $resultOfReduction, $suffix$)
+         */
+        private Set<PatternDescription> reduceNestedPatterns(Set<PatternDescription> patterns) {
+            /* implementation note:
+             * finding a sub-set of patterns that only differ in a single
+             * column is time-consuming task, so this method speeds it up by:
+             * - group the patterns by their record class
+             * - for each column (nested pattern) do:
+             * -- group patterns by their hash
+             * -- in each such by-hash group, find sub-sets that only differ in
+             *    the chosen column, and then call reduceBindingPatterns and reduceNestedPatterns
+             *    on patterns in the chosen column, as described above
+             */
+            var groupByRecordClass =
+                    patterns.stream()
+                            .filter(pd -> pd instanceof RecordPattern)
+                            .map(pd -> (RecordPattern) pd)
+                            .collect(groupingBy(pd -> (ClassSymbol) pd.recordType.tsym));
+
+            for (var e : groupByRecordClass.entrySet()) {
+                int nestedPatternsCount = e.getKey().getRecordComponents().size();
+                Set<RecordPattern> current = new HashSet<>(e.getValue());
+
+                for (int mismatchingCandidate = 0;
+                     mismatchingCandidate < nestedPatternsCount;
+                     mismatchingCandidate++) {
+                    int mismatchingCandidateFin = mismatchingCandidate;
+                    var groupByHashes =
+                            current
+                             .stream()
+                             //error recovery, ignore patterns with incorrect number of nested patterns:
+                             .filter(pd -> pd.nested.length == nestedPatternsCount)
+                             .collect(groupingBy(pd -> pd.hashCode(mismatchingCandidateFin)));
+                    for (var candidates : groupByHashes.values()) {
+                        var candidatesArr = candidates.toArray(RecordPattern[]::new);
+
+                        for (int firstCandidate = 0;
+                             firstCandidate < candidatesArr.length;
+                             firstCandidate++) {
+                            RecordPattern rpOne = candidatesArr[firstCandidate];
+                            ListBuffer<RecordPattern> join = new ListBuffer<>();
+
+                            join.append(rpOne);
+
+                            NEXT_PATTERN: for (int nextCandidate = 0;
+                                               nextCandidate < candidatesArr.length;
+                                               nextCandidate++) {
+                                if (firstCandidate == nextCandidate) {
+                                    continue;
+                                }
+
+                                RecordPattern rpOther = candidatesArr[nextCandidate];
+                                if (rpOne.recordType.tsym == rpOther.recordType.tsym) {
+                                    for (int i = 0; i < rpOne.nested.length; i++) {
+                                        if (i != mismatchingCandidate &&
+                                            !rpOne.nested[i].equals(rpOther.nested[i])) {
+                                            continue NEXT_PATTERN;
+                                        }
+                                    }
+                                    join.append(rpOther);
+                                }
+                            }
+
+                            var nestedPatterns = join.stream().map(rp -> rp.nested[mismatchingCandidateFin]).collect(Collectors.toSet());
+                            var updatedPatterns = reduceNestedPatterns(nestedPatterns);
+
+                            updatedPatterns = reduceRecordPatterns(updatedPatterns);
+                            updatedPatterns = removeCoveredRecordPatterns(updatedPatterns);
+                            updatedPatterns = reduceBindingPatterns(rpOne.fullComponentTypes()[mismatchingCandidateFin], updatedPatterns);
+
+                            if (!nestedPatterns.equals(updatedPatterns)) {
+                                current.removeAll(join);
+
+                                for (PatternDescription nested : updatedPatterns) {
+                                    PatternDescription[] newNested =
+                                            Arrays.copyOf(rpOne.nested, rpOne.nested.length);
+                                    newNested[mismatchingCandidateFin] = nested;
+                                    current.add(new RecordPattern(rpOne.recordType(),
+                                                                    rpOne.fullComponentTypes(),
+                                                                    newNested));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!current.equals(new HashSet<>(e.getValue()))) {
+                    Set<PatternDescription> result = new HashSet<>(patterns);
+                    result.removeAll(e.getValue());
+                    result.addAll(current);
+                    return result;
+                }
+            }
+            return patterns;
+        }
+
+        /* In the set of patterns, find those for which, given:
+         * $record($nested1, $nested2, ...)
+         * all the $nestedX pattern cover the given record component,
+         * and replace those with a simple binding pattern over $record.
+         */
+        private Set<PatternDescription> reduceRecordPatterns(Set<PatternDescription> patterns) {
+            var newPatterns = new HashSet<PatternDescription>();
+            boolean modified = false;
+            for (PatternDescription pd : patterns) {
+                if (pd instanceof RecordPattern rpOne) {
+                    PatternDescription reducedPattern = reduceRecordPattern(rpOne);
+                    if (reducedPattern != rpOne) {
+                        newPatterns.add(reducedPattern);
+                        modified = true;
+                        continue;
+                    }
+                }
+                newPatterns.add(pd);
+            }
+            return modified ? newPatterns : patterns;
+        }
+
+        private PatternDescription reduceRecordPattern(PatternDescription pattern) {
+            if (pattern instanceof RecordPattern rpOne) {
+                Type[] componentType = rpOne.fullComponentTypes();
+                //error recovery, ignore patterns with incorrect number of nested patterns:
+                if (componentType.length != rpOne.nested.length) {
+                    return pattern;
+                }
+                PatternDescription[] reducedNestedPatterns = null;
+                boolean covered = true;
+                for (int i = 0; i < componentType.length; i++) {
+                    PatternDescription newNested = reduceRecordPattern(rpOne.nested[i]);
+                    if (newNested != rpOne.nested[i]) {
+                        if (reducedNestedPatterns == null) {
+                            reducedNestedPatterns = Arrays.copyOf(rpOne.nested, rpOne.nested.length);
+                        }
+                        reducedNestedPatterns[i] = newNested;
+                    }
+
+                    covered &= newNested instanceof BindingPattern bp &&
+                               types.isSubtype(types.erasure(componentType[i]), types.erasure(bp.type));
+                }
+                if (covered) {
+                    return new BindingPattern(rpOne.recordType);
+                } else if (reducedNestedPatterns != null) {
+                    return new RecordPattern(rpOne.recordType, rpOne.fullComponentTypes(), reducedNestedPatterns);
+                }
+            }
+            return pattern;
+        }
+
+        private Set<PatternDescription> removeCoveredRecordPatterns(Set<PatternDescription> patterns) {
+            Set<Symbol> existingBindings = patterns.stream()
+                                                   .filter(pd -> pd instanceof BindingPattern)
+                                                   .map(pd -> ((BindingPattern) pd).type.tsym)
+                                                   .collect(Collectors.toSet());
+            Set<PatternDescription> result = new HashSet<>(patterns);
+
+            for (Iterator<PatternDescription> it = result.iterator(); it.hasNext();) {
+                PatternDescription pd = it.next();
+                if (pd instanceof RecordPattern rp && existingBindings.contains(rp.recordType.tsym)) {
+                    it.remove();
+                }
+            }
+
+            return result;
+        }
+
         public void visitTry(JCTry tree) {
             ListBuffer<PendingExit> prevPendingExits = pendingExits;
             pendingExits = new ListBuffer<>();
             for (JCTree resource : tree.resources) {
-                if (resource instanceof JCVariableDecl) {
-                    JCVariableDecl vdecl = (JCVariableDecl) resource;
-                    visitVarDef(vdecl);
-                } else if (resource instanceof JCExpression) {
-                    scan((JCExpression) resource);
+                if (resource instanceof JCVariableDecl variableDecl) {
+                    visitVarDef(variableDecl);
+                } else if (resource instanceof JCExpression expression) {
+                    scan(expression);
                 } else {
                     throw new AssertionError(tree);  // parser error
                 }
@@ -896,20 +1325,22 @@ public class Flow {
             for (PendingExit exit = pendingExits.next();
                  exit != null;
                  exit = pendingExits.next()) {
-                Assert.check(exit instanceof ThrownPendingExit);
-                ThrownPendingExit thrownExit = (ThrownPendingExit) exit;
-                if (classDef != null &&
-                    classDef.pos == exit.tree.pos) {
-                    log.error(exit.tree.pos(),
-                              Errors.UnreportedExceptionDefaultConstructor(thrownExit.thrown));
-                } else if (exit.tree.hasTag(VARDEF) &&
-                        ((JCVariableDecl)exit.tree).sym.isResourceVariable()) {
-                    log.error(exit.tree.pos(),
-                              Errors.UnreportedExceptionImplicitClose(thrownExit.thrown,
-                                                                      ((JCVariableDecl)exit.tree).sym.name));
+                if (exit instanceof ThrownPendingExit thrownExit) {
+                    if (classDef != null &&
+                        classDef.pos == exit.tree.pos) {
+                        log.error(exit.tree.pos(),
+                                  Errors.UnreportedExceptionDefaultConstructor(thrownExit.thrown));
+                    } else if (exit.tree.hasTag(VARDEF) &&
+                            ((JCVariableDecl)exit.tree).sym.isResourceVariable()) {
+                        log.error(exit.tree.pos(),
+                                  Errors.UnreportedExceptionImplicitClose(thrownExit.thrown,
+                                                                          ((JCVariableDecl)exit.tree).sym.name));
+                    } else {
+                        log.error(exit.tree.pos(),
+                                  Errors.UnreportedExceptionNeedToCatchOrThrow(thrownExit.thrown));
+                    }
                 } else {
-                    log.error(exit.tree.pos(),
-                              Errors.UnreportedExceptionNeedToCatchOrThrow(thrownExit.thrown));
+                    Assert.check(log.hasErrorOn(exit.tree.pos()));
                 }
             }
         }
@@ -951,40 +1382,10 @@ public class Flow {
 
             try {
                 // process all the static initializers
-                for (List<JCTree> l = tree.defs; l.nonEmpty(); l = l.tail) {
-                    if (!l.head.hasTag(METHODDEF) &&
-                        (TreeInfo.flags(l.head) & STATIC) != 0) {
-                        scan(l.head);
-                        errorUncaught();
-                    }
-                }
-
-                // add intersection of all thrown clauses of initial constructors
-                // to set of caught exceptions, unless class is anonymous.
-                if (!anonymousClass) {
-                    boolean firstConstructor = true;
-                    for (List<JCTree> l = tree.defs; l.nonEmpty(); l = l.tail) {
-                        if (TreeInfo.isInitialConstructor(l.head)) {
-                            List<Type> mthrown =
-                                ((JCMethodDecl) l.head).sym.type.getThrownTypes();
-                            if (firstConstructor) {
-                                caught = mthrown;
-                                firstConstructor = false;
-                            } else {
-                                caught = chk.intersect(mthrown, caught);
-                            }
-                        }
-                    }
-                }
-
-                // process all the instance initializers
-                for (List<JCTree> l = tree.defs; l.nonEmpty(); l = l.tail) {
-                    if (!l.head.hasTag(METHODDEF) &&
-                        (TreeInfo.flags(l.head) & STATIC) == 0) {
-                        scan(l.head);
-                        errorUncaught();
-                    }
-                }
+                forEachInitializer(tree, true, def -> {
+                    scan(def);
+                    errorUncaught();
+                });
 
                 // in an anonymous class, add the set of thrown exceptions to
                 // the throws clause of the synthetic constructor and propagate
@@ -1039,7 +1440,7 @@ public class Flow {
                     JCVariableDecl def = l.head;
                     scan(def);
                 }
-                if (TreeInfo.isInitialConstructor(tree))
+                if (TreeInfo.hasConstructorCall(tree, names._super))
                     caught = chk.union(caught, mthrown);
                 else if ((tree.sym.flags() & (BLOCK | STATIC)) != BLOCK)
                     caught = mthrown;
@@ -1146,7 +1547,7 @@ public class Flow {
             scan(selector);
             for (List<JCCase> l = cases; l.nonEmpty(); l = l.tail) {
                 JCCase c = l.head;
-                scan(c.pats);
+                scan(c.labels);
                 scan(c.stats);
             }
             if (tree.hasTag(SWITCH_EXPRESSION)) {
@@ -1172,11 +1573,10 @@ public class Flow {
             ListBuffer<PendingExit> prevPendingExits = pendingExits;
             pendingExits = new ListBuffer<>();
             for (JCTree resource : tree.resources) {
-                if (resource instanceof JCVariableDecl) {
-                    JCVariableDecl vdecl = (JCVariableDecl) resource;
-                    visitVarDef(vdecl);
-                } else if (resource instanceof JCExpression) {
-                    scan((JCExpression) resource);
+                if (resource instanceof JCVariableDecl variableDecl) {
+                    visitVarDef(variableDecl);
+                } else if (resource instanceof JCExpression expression) {
+                    scan(expression);
                 } else {
                     throw new AssertionError(tree);  // parser error
                 }
@@ -1221,7 +1621,8 @@ public class Flow {
                         ctypes = ctypes.append(exc);
                         if (types.isSameType(exc, syms.objectType))
                             continue;
-                        checkCaughtType(l.head.pos(), exc, thrownInTry, caughtInTry);
+                        var pos = subClauses.size() > 1 ? ct.pos() : l.head.pos();
+                        checkCaughtType(pos, exc, thrownInTry, caughtInTry);
                         caughtInTry = chk.incl(exc, caughtInTry);
                     }
                 }
@@ -1265,6 +1666,15 @@ public class Flow {
             }
         }
 
+        @Override
+        public void visitStringTemplate(JCStringTemplate tree) {
+            for (Type thrown : tree.processMethodType.getThrownTypes()) {
+                markThrown(tree, thrown);
+            }
+
+            scan(tree.expressions);
+        }
+
         void checkCaughtType(DiagnosticPosition pos, Type exc, List<Type> thrownInTry, List<Type> caughtInTry) {
             if (chk.subset(exc, caughtInTry)) {
                 log.error(pos, Errors.ExceptAlreadyCaught(exc));
@@ -1274,7 +1684,7 @@ public class Flow {
                 log.error(pos, Errors.ExceptNeverThrownInTry(exc));
             } else {
                 List<Type> catchableThrownTypes = chk.intersect(List.of(exc), thrownInTry);
-                // 'catchableThrownTypes' cannnot possibly be empty - if 'exc' was an
+                // 'catchableThrownTypes' cannot possibly be empty - if 'exc' was an
                 // unchecked exception, the result list would not be empty, as the augmented
                 // thrown set includes { RuntimeException, Error }; if 'exc' was a checked
                 // exception, that would have been covered in the branch above
@@ -1331,8 +1741,18 @@ public class Flow {
         public void visitApply(JCMethodInvocation tree) {
             scan(tree.meth);
             scan(tree.args);
+
+            // Mark as thrown the exceptions thrown by the method being invoked
             for (List<Type> l = tree.meth.type.getThrownTypes(); l.nonEmpty(); l = l.tail)
                 markThrown(tree, l.head);
+
+            // After super(), scan initializers to uncover any exceptions they throw
+            if (TreeInfo.name(tree.meth) == names._super) {
+                forEachInitializer(classDef, false, def -> {
+                    scan(def);
+                    errorUncaught();
+                });
+            }
         }
 
         public void visitNewClass(JCNewClass tree) {
@@ -1463,6 +1883,41 @@ public class Flow {
         @Override
         public void visitClassDef(JCClassDecl tree) {
             //skip
+        }
+    }
+
+    /**
+     * Determine if alive after the given tree.
+     */
+    class SnippetAliveAnalyzer extends AliveAnalyzer {
+        @Override
+        public void visitClassDef(JCClassDecl tree) {
+            //skip
+        }
+        @Override
+        public void visitLambda(JCLambda tree) {
+            //skip
+        }
+        public boolean isAlive() {
+            return super.alive != Liveness.DEAD;
+        }
+    }
+
+    class SnippetBreakToAnalyzer extends AliveAnalyzer {
+        private final JCTree breakTo;
+        private boolean breaksTo;
+
+        public SnippetBreakToAnalyzer(JCTree breakTo) {
+            this.breakTo = breakTo;
+        }
+
+        @Override
+        public void visitBreak(JCBreak tree) {
+            breaksTo |= breakTo == tree.target && super.alive == Liveness.ALIVE;
+        }
+
+        public boolean breaksTo() {
+            return breaksTo;
         }
     }
 
@@ -1640,11 +2095,11 @@ public class Flow {
             uninitsWhenFalse = new Bits(true);
         }
 
-        private boolean isInitialConstructor = false;
+        private boolean isConstructor;
 
         @Override
         protected void markDead() {
-            if (!isInitialConstructor) {
+            if (!isConstructor) {
                 inits.inclRange(returnadr, nextadr);
             } else {
                 for (int address = returnadr; address < nextadr; address++) {
@@ -1764,8 +2219,9 @@ public class Flow {
         void checkInit(DiagnosticPosition pos, VarSymbol sym, Error errkey) {
             if ((sym.adr >= firstadr || sym.owner.kind != TYP) &&
                 trackable(sym) &&
-                !inits.isMember(sym.adr)) {
-                log.error(pos, errkey);
+                !inits.isMember(sym.adr) &&
+                (sym.flags_field & CLASH) == 0) {
+                    log.error(pos, errkey);
                 inits.incl(sym.adr);
             }
         }
@@ -1821,6 +2277,10 @@ public class Flow {
                     scanExpr(l.head);
         }
 
+        void scanPattern(JCTree tree) {
+            scan(tree);
+        }
+
         /** Analyze a condition. Make sure to set (un)initsWhenTrue(WhenFalse)
          *  rather than (un)inits on exit.
          */
@@ -1861,10 +2321,6 @@ public class Flow {
             Lint lintPrev = lint;
             lint = lint.augment(tree.sym);
             try {
-                if (tree.sym == null) {
-                    return;
-                }
-
                 JCClassDecl classDefPrev = classDef;
                 int firstadrPrev = firstadr;
                 int nextadrPrev = nextadr;
@@ -1890,10 +2346,17 @@ public class Flow {
                     }
 
                     // process all the static initializers
-                    for (List<JCTree> l = tree.defs; l.nonEmpty(); l = l.tail) {
-                        if (!l.head.hasTag(METHODDEF) &&
-                            (TreeInfo.flags(l.head) & STATIC) != 0) {
-                            scan(l.head);
+                    forEachInitializer(tree, true, def -> {
+                        scan(def);
+                        clearPendingExits(false);
+                    });
+
+                    // verify all static final fields got initailized
+                    for (int i = firstadr; i < nextadr; i++) {
+                        JCVariableDecl vardecl = vardecls[i];
+                        VarSymbol var = vardecl.sym;
+                        if (var.owner == classDef.sym && var.isStatic()) {
+                            checkInit(TreeInfo.diagnosticPositionFor(var, vardecl), var);
                         }
                     }
 
@@ -1907,14 +2370,6 @@ public class Flow {
                                     newVar(def);
                                 }
                             }
-                        }
-                    }
-
-                    // process all the instance initializers
-                    for (List<JCTree> l = tree.defs; l.nonEmpty(); l = l.tail) {
-                        if (!l.head.hasTag(METHODDEF) &&
-                            (TreeInfo.flags(l.head) & STATIC) == 0) {
-                            scan(l.head);
                         }
                     }
 
@@ -1949,15 +2404,6 @@ public class Flow {
             Lint lintPrev = lint;
             lint = lint.augment(tree.sym);
             try {
-                if (tree.body == null) {
-                    return;
-                }
-                /*  Ignore synthetic methods, except for translated lambda methods.
-                 */
-                if ((tree.sym.flags() & (SYNTHETIC | LAMBDA_METHOD)) == SYNTHETIC) {
-                    return;
-                }
-
                 final Bits initsPrev = new Bits(inits);
                 final Bits uninitsPrev = new Bits(uninits);
                 int nextadrPrev = nextadr;
@@ -1965,13 +2411,16 @@ public class Flow {
                 int returnadrPrev = returnadr;
 
                 Assert.check(pendingExits.isEmpty());
-                boolean lastInitialConstructor = isInitialConstructor;
+                boolean isConstructorPrev = isConstructor;
                 try {
-                    isInitialConstructor = TreeInfo.isInitialConstructor(tree);
+                    isConstructor = TreeInfo.isConstructor(tree);
 
-                    if (!isInitialConstructor) {
+                    // We only track field initialization inside constructors
+                    if (!isConstructor) {
                         firstadr = nextadr;
                     }
+
+                    // Mark all method parameters as DA
                     for (List<JCVariableDecl> l = tree.params; l.nonEmpty(); l = l.tail) {
                         JCVariableDecl def = l.head;
                         scan(def);
@@ -1985,53 +2434,75 @@ public class Flow {
                     // leave caught unchanged.
                     scan(tree.body);
 
-                    if (isInitialConstructor) {
+                    boolean isCompactOrGeneratedRecordConstructor = (tree.sym.flags() & Flags.COMPACT_RECORD_CONSTRUCTOR) != 0 ||
+                            (tree.sym.flags() & (GENERATEDCONSTR | RECORD)) == (GENERATEDCONSTR | RECORD);
+                    if (isConstructor) {
                         boolean isSynthesized = (tree.sym.flags() &
                                                  GENERATEDCONSTR) != 0;
                         for (int i = firstadr; i < nextadr; i++) {
                             JCVariableDecl vardecl = vardecls[i];
                             VarSymbol var = vardecl.sym;
-                            if (var.owner == classDef.sym) {
+                            if (var.owner == classDef.sym && !var.isStatic()) {
                                 // choose the diagnostic position based on whether
                                 // the ctor is default(synthesized) or not
-                                if (isSynthesized) {
+                                if (isSynthesized && !isCompactOrGeneratedRecordConstructor) {
                                     checkInit(TreeInfo.diagnosticPositionFor(var, vardecl),
-                                        var, Errors.VarNotInitializedInDefaultConstructor(var));
+                                            var, Errors.VarNotInitializedInDefaultConstructor(var));
+                                } else if (isCompactOrGeneratedRecordConstructor) {
+                                    boolean isInstanceRecordField = var.enclClass().isRecord() &&
+                                            (var.flags_field & (Flags.PRIVATE | Flags.FINAL | Flags.GENERATED_MEMBER | Flags.RECORD)) != 0 &&
+                                            var.owner.kind == TYP;
+                                    if (isInstanceRecordField) {
+                                        boolean notInitialized = !inits.isMember(var.adr);
+                                        if (notInitialized && uninits.isMember(var.adr) && tree.completesNormally) {
+                                        /*  this way we indicate Lower that it should generate an initialization for this field
+                                         *  in the compact constructor
+                                         */
+                                            var.flags_field |= UNINITIALIZED_FIELD;
+                                        } else {
+                                            checkInit(TreeInfo.diagEndPos(tree.body), var);
+                                        }
+                                    } else {
+                                        checkInit(TreeInfo.diagnosticPositionFor(var, vardecl), var);
+                                    }
                                 } else {
                                     checkInit(TreeInfo.diagEndPos(tree.body), var);
                                 }
                             }
                         }
                     }
-                    List<PendingExit> exits = pendingExits.toList();
-                    pendingExits = new ListBuffer<>();
-                    while (exits.nonEmpty()) {
-                        PendingExit exit = exits.head;
-                        exits = exits.tail;
-                        Assert.check(exit.tree.hasTag(RETURN) ||
-                                         log.hasErrorOn(exit.tree.pos()),
-                                     exit.tree);
-                        if (isInitialConstructor) {
-                            Assert.check(exit instanceof AssignPendingExit);
-                            inits.assign(((AssignPendingExit) exit).exit_inits);
-                            for (int i = firstadr; i < nextadr; i++) {
-                                checkInit(exit.tree.pos(), vardecls[i].sym);
-                            }
-                        }
-                    }
+                    clearPendingExits(true);
                 } finally {
                     inits.assign(initsPrev);
                     uninits.assign(uninitsPrev);
                     nextadr = nextadrPrev;
                     firstadr = firstadrPrev;
                     returnadr = returnadrPrev;
-                    isInitialConstructor = lastInitialConstructor;
+                    isConstructor = isConstructorPrev;
                 }
             } finally {
                 lint = lintPrev;
             }
         }
 
+        private void clearPendingExits(boolean inMethod) {
+            List<PendingExit> exits = pendingExits.toList();
+            pendingExits = new ListBuffer<>();
+            while (exits.nonEmpty()) {
+                PendingExit exit = exits.head;
+                exits = exits.tail;
+                Assert.check((inMethod && exit.tree.hasTag(RETURN)) ||
+                                 log.hasErrorOn(exit.tree.pos()),
+                             exit.tree);
+                if (inMethod && isConstructor) {
+                    Assert.check(exit instanceof AssignPendingExit);
+                    inits.assign(((AssignPendingExit) exit).exit_inits);
+                    for (int i = firstadr; i < nextadr; i++) {
+                        checkInit(exit.tree.pos(), vardecls[i].sym);
+                    }
+                }
+            }
+        }
         protected void initParam(JCVariableDecl def) {
             inits.incl(def.sym.adr);
             uninits.excl(def.sym.adr);
@@ -2217,52 +2688,46 @@ public class Flow {
         }
 
         public void visitSwitch(JCSwitch tree) {
-            handleSwitch(tree, tree.selector, tree.cases);
+            handleSwitch(tree, tree.selector, tree.cases, tree.isExhaustive);
         }
 
         public void visitSwitchExpression(JCSwitchExpression tree) {
-            handleSwitch(tree, tree.selector, tree.cases);
+            handleSwitch(tree, tree.selector, tree.cases, tree.isExhaustive);
         }
 
-        private void handleSwitch(JCTree tree, JCExpression selector, List<JCCase> cases) {
+        private void handleSwitch(JCTree tree, JCExpression selector,
+                                  List<JCCase> cases, boolean isExhaustive) {
             ListBuffer<PendingExit> prevPendingExits = pendingExits;
             pendingExits = new ListBuffer<>();
             int nextadrPrev = nextadr;
             scanExpr(selector);
             final Bits initsSwitch = new Bits(inits);
             final Bits uninitsSwitch = new Bits(uninits);
-            boolean hasDefault = false;
             for (List<JCCase> l = cases; l.nonEmpty(); l = l.tail) {
                 inits.assign(initsSwitch);
                 uninits.assign(uninits.andSet(uninitsSwitch));
                 JCCase c = l.head;
-                if (c.pats.isEmpty()) {
-                    hasDefault = true;
-                } else {
-                    for (JCExpression pat : c.pats) {
-                        scanExpr(pat);
-                    }
+                for (JCCaseLabel pat : c.labels) {
+                    scanPattern(pat);
                 }
-                if (hasDefault) {
-                    inits.assign(initsSwitch);
-                    uninits.assign(uninits.andSet(uninitsSwitch));
+                scan(c.guard);
+                if (inits.isReset()) {
+                    inits.assign(initsWhenTrue);
+                    uninits.assign(uninitsWhenTrue);
                 }
                 scan(c.stats);
                 if (c.completesNormally && c.caseKind == JCCase.RULE) {
                     scanSyntheticBreak(make, tree);
                 }
                 addVars(c.stats, initsSwitch, uninitsSwitch);
-                if (!hasDefault) {
-                    inits.assign(initsSwitch);
-                    uninits.assign(uninits.andSet(uninitsSwitch));
-                }
                 // Warn about fall-through if lint switch fallthrough enabled.
             }
-            if (!hasDefault) {
+            if (!isExhaustive) {
                 if (tree.hasTag(SWITCH_EXPRESSION)) {
                     markDead();
-                } else {
-                    inits.andSet(initsSwitch);
+                } else if (tree.hasTag(SWITCH) && !TreeInfo.expectedExhaustive((JCSwitch) tree)) {
+                    inits.assign(initsSwitch);
+                    uninits.assign(uninits.andSet(uninitsSwitch));
                 }
             }
             if (tree.hasTag(SWITCH_EXPRESSION)) {
@@ -2294,13 +2759,12 @@ public class Flow {
             final Bits initsTry = new Bits(inits);
             uninitsTry.assign(uninits);
             for (JCTree resource : tree.resources) {
-                if (resource instanceof JCVariableDecl) {
-                    JCVariableDecl vdecl = (JCVariableDecl) resource;
-                    visitVarDef(vdecl);
-                    unrefdResources.enter(vdecl.sym);
-                    resourceVarDecls.append(vdecl);
-                } else if (resource instanceof JCExpression) {
-                    scanExpr((JCExpression) resource);
+                if (resource instanceof JCVariableDecl variableDecl) {
+                    visitVarDef(variableDecl);
+                    unrefdResources.enter(variableDecl.sym);
+                    resourceVarDecls.append(variableDecl);
+                } else if (resource instanceof JCExpression expression) {
+                    scanExpr(expression);
                 } else {
                     throw new AssertionError(tree);  // parser error
                 }
@@ -2314,7 +2778,7 @@ public class Flow {
             if (!resourceVarDecls.isEmpty() &&
                     lint.isEnabled(Lint.LintCategory.TRY)) {
                 for (JCVariableDecl resVar : resourceVarDecls) {
-                    if (unrefdResources.includes(resVar.sym)) {
+                    if (unrefdResources.includes(resVar.sym) && !resVar.sym.isUnnamedVariable()) {
                         log.warning(Lint.LintCategory.TRY, resVar.pos(),
                                     Warnings.TryResourceNotReferenced(resVar.sym));
                         unrefdResources.remove(resVar.sym);
@@ -2357,9 +2821,9 @@ public class Flow {
                     // versus finally!
                     while (exits.nonEmpty()) {
                         PendingExit exit = exits.next();
-                        if (exit instanceof AssignPendingExit) {
-                            ((AssignPendingExit) exit).exit_inits.orSet(inits);
-                            ((AssignPendingExit) exit).exit_uninits.andSet(uninits);
+                        if (exit instanceof AssignPendingExit assignPendingExit) {
+                            assignPendingExit.exit_inits.orSet(inits);
+                            assignPendingExit.exit_uninits.andSet(uninits);
                         }
                         pendingExits.append(exit);
                     }
@@ -2462,7 +2926,7 @@ public class Flow {
                 recordExit(exit);
                 return ;
             } else {
-                scan(tree.value);
+                scanExpr(tree.value);
                 recordExit(new AssignPendingExit(tree, inits, uninits));
             }
         }
@@ -2486,6 +2950,28 @@ public class Flow {
         public void visitApply(JCMethodInvocation tree) {
             scanExpr(tree.meth);
             scanExprs(tree.args);
+
+            // Handle superclass constructor invocations
+            if (isConstructor) {
+
+                // If super(): at this point all initialization blocks will execute
+                Name name = TreeInfo.name(tree.meth);
+                if (name == names._super) {
+                    forEachInitializer(classDef, false, def -> {
+                        scan(def);
+                        clearPendingExits(false);
+                    });
+                }
+
+                // If this(): at this point all final uninitialized fields will get initialized
+                else if (name == names._this) {
+                    for (int address = firstadr; address < nextadr; address++) {
+                        VarSymbol sym = vardecls[address].sym;
+                        if (isFinalUninitializedField(sym) && !sym.isStatic())
+                            letInit(tree.pos(), sym);
+                    }
+                }
+            }
         }
 
         public void visitNewClass(JCNewClass tree) {
@@ -2497,11 +2983,17 @@ public class Flow {
         @Override
         public void visitLambda(JCLambda tree) {
             final Bits prevUninits = new Bits(uninits);
+            final Bits prevUninitsTry = new Bits(uninitsTry);
             final Bits prevInits = new Bits(inits);
             int returnadrPrev = returnadr;
             int nextadrPrev = nextadr;
             ListBuffer<PendingExit> prevPending = pendingExits;
             try {
+                // JLS 16.1.10: No rule allows V to be definitely unassigned before a lambda
+                // body. This is by design: a variable that was definitely unassigned before the
+                // lambda body may end up being assigned to later on, so we cannot conclude that
+                // the variable will be unassigned when the body is executed.
+                uninits.excludeFrom(firstadr);
                 returnadr = nextadr;
                 pendingExits = new ListBuffer<>();
                 for (List<JCVariableDecl> l = tree.params; l.nonEmpty(); l = l.tail) {
@@ -2519,6 +3011,7 @@ public class Flow {
             finally {
                 returnadr = returnadrPrev;
                 uninits.assign(prevUninits);
+                uninitsTry.assign(prevUninitsTry);
                 inits.assign(prevInits);
                 pendingExits = prevPending;
                 nextadr = nextadrPrev;
@@ -2623,6 +3116,18 @@ public class Flow {
             }
         }
 
+        @Override
+        public void visitTypeTest(JCInstanceOf tree) {
+            scanExpr(tree.expr);
+            scan(tree.pattern);
+        }
+
+        @Override
+        public void visitBindingPattern(JCBindingPattern tree) {
+            scan(tree.var);
+            initParam(tree.var);
+        }
+
         void referenced(Symbol sym) {
             unrefdResources.remove(sym);
         }
@@ -2693,6 +3198,7 @@ public class Flow {
     class CaptureAnalyzer extends BaseAnalyzer {
 
         JCTree currentTree; //local class or lambda
+        WriteableScope declaredInsideGuard;
 
         @Override
         void markDead() {
@@ -2703,15 +3209,10 @@ public class Flow {
         void checkEffectivelyFinal(DiagnosticPosition pos, VarSymbol sym) {
             if (currentTree != null &&
                     sym.owner.kind == MTH &&
-                    sym.pos < currentTree.getStartPosition()) {
+                    sym.pos < getCurrentTreeStartPosition()) {
                 switch (currentTree.getTag()) {
                     case CLASSDEF:
-                        if (!allowEffectivelyFinalInInnerClasses) {
-                            if ((sym.flags() & FINAL) == 0) {
-                                reportInnerClsNeedsFinalError(pos, sym);
-                            }
-                            break;
-                        }
+                    case CASE:
                     case LAMBDA:
                         if ((sym.flags() & (EFFECTIVELY_FINAL | FINAL)) == 0) {
                            reportEffectivelyFinalError(pos, sym);
@@ -2720,37 +3221,43 @@ public class Flow {
             }
         }
 
+        int getCurrentTreeStartPosition() {
+            return currentTree instanceof JCCase cse ? cse.guard.getStartPosition()
+                                                     : currentTree.getStartPosition();
+        }
+
         @SuppressWarnings("fallthrough")
         void letInit(JCTree tree) {
             tree = TreeInfo.skipParens(tree);
             if (tree.hasTag(IDENT) || tree.hasTag(SELECT)) {
                 Symbol sym = TreeInfo.symbol(tree);
-                if (currentTree != null &&
-                        sym.kind == VAR &&
-                        sym.owner.kind == MTH &&
-                        ((VarSymbol)sym).pos < currentTree.getStartPosition()) {
+                if (currentTree != null) {
                     switch (currentTree.getTag()) {
-                        case CLASSDEF:
-                            if (!allowEffectivelyFinalInInnerClasses) {
-                                reportInnerClsNeedsFinalError(tree, sym);
-                                break;
+                        case CLASSDEF, LAMBDA -> {
+                            if (sym.kind == VAR &&
+                                sym.owner.kind == MTH &&
+                                ((VarSymbol)sym).pos < currentTree.getStartPosition()) {
+                                reportEffectivelyFinalError(tree, sym);
                             }
-                        case LAMBDA:
-                            reportEffectivelyFinalError(tree, sym);
+                        }
+                        case CASE -> {
+                            if (!declaredInsideGuard.includes(sym)) {
+                                log.error(tree.pos(), Errors.CannotAssignNotDeclaredGuard(sym));
+                            }
+                        }
                     }
                 }
             }
         }
 
         void reportEffectivelyFinalError(DiagnosticPosition pos, Symbol sym) {
-            String subKey = currentTree.hasTag(LAMBDA) ?
-                  "lambda"  : "inner.cls";
+            Fragment subKey = switch (currentTree.getTag()) {
+                case LAMBDA -> Fragments.Lambda;
+                case CASE -> Fragments.Guard;
+                case CLASSDEF -> Fragments.InnerCls;
+                default -> throw new AssertionError("Unexpected tree kind: " + currentTree.getTag());
+            };
             log.error(pos, Errors.CantRefNonEffectivelyFinalVar(sym, diags.fragment(subKey)));
-        }
-
-        void reportInnerClsNeedsFinalError(DiagnosticPosition pos, Symbol sym) {
-            log.error(pos,
-                      Errors.LocalVarAccessedFromIclsNeedsFinal(sym));
         }
 
     /*************************************************************************
@@ -2762,7 +3269,7 @@ public class Flow {
         public void visitClassDef(JCClassDecl tree) {
             JCTree prevTree = currentTree;
             try {
-                currentTree = tree.sym.isLocal() ? tree : null;
+                currentTree = tree.sym.isDirectlyOrIndirectlyLocal() ? tree : null;
                 super.visitClassDef(tree);
             } finally {
                 currentTree = prevTree;
@@ -2778,6 +3285,35 @@ public class Flow {
             } finally {
                 currentTree = prevTree;
             }
+        }
+
+        @Override
+        public void visitBindingPattern(JCBindingPattern tree) {
+            scan(tree.var);
+        }
+
+        @Override
+        public void visitCase(JCCase tree) {
+            scan(tree.labels);
+            if (tree.guard != null) {
+                JCTree prevTree = currentTree;
+                WriteableScope prevDeclaredInsideGuard = declaredInsideGuard;
+                try {
+                    currentTree = tree;
+                    declaredInsideGuard = WriteableScope.create(attrEnv.enclClass.sym);
+                    scan(tree.guard);
+                } finally {
+                    currentTree = prevTree;
+                    declaredInsideGuard = prevDeclaredInsideGuard;
+                }
+            }
+            scan(tree.stats);
+        }
+
+        @Override
+        public void visitRecordPattern(JCRecordPattern tree) {
+            scan(tree.deconstructor);
+            scan(tree.nested);
         }
 
         @Override
@@ -2824,6 +3360,14 @@ public class Flow {
                 }
             }
             super.visitTry(tree);
+        }
+
+        @Override
+        public void visitVarDef(JCVariableDecl tree) {
+            if (declaredInsideGuard != null) {
+                declaredInsideGuard.enter(tree.sym);
+            }
+            super.visitVarDef(tree);
         }
 
         @Override
@@ -2910,4 +3454,93 @@ public class Flow {
         }
     }
 
+    sealed interface PatternDescription { }
+    public PatternDescription makePatternDescription(Type selectorType, JCPattern pattern) {
+        if (pattern instanceof JCBindingPattern binding) {
+            Type type = types.isSubtype(selectorType, binding.type)
+                    ? selectorType : binding.type;
+            return new BindingPattern(type);
+        } else if (pattern instanceof JCRecordPattern record) {
+            Type[] componentTypes;
+
+            if (!record.type.isErroneous()) {
+                componentTypes = ((ClassSymbol) record.type.tsym).getRecordComponents()
+                        .map(r -> types.memberType(record.type, r))
+                        .toArray(s -> new Type[s]);
+            }
+            else {
+                componentTypes = record.nested.map(t -> types.createErrorType(t.type)).toArray(s -> new Type[s]);;
+            }
+
+            PatternDescription[] nestedDescriptions =
+                    new PatternDescription[record.nested.size()];
+            int i = 0;
+            for (List<JCPattern> it = record.nested;
+                 it.nonEmpty();
+                 it = it.tail, i++) {
+                Type componentType = i < componentTypes.length ? componentTypes[i]
+                                                               : syms.errType;
+                nestedDescriptions[i] = makePatternDescription(types.erasure(componentType), it.head);
+            }
+            return new RecordPattern(record.type, componentTypes, nestedDescriptions);
+        } else if (pattern instanceof JCAnyPattern) {
+            return new BindingPattern(selectorType);
+        } else {
+            throw Assert.error();
+        }
+    }
+    record BindingPattern(Type type) implements PatternDescription {
+        @Override
+        public int hashCode() {
+            return type.tsym.hashCode();
+        }
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof BindingPattern other &&
+                    type.tsym == other.type.tsym;
+        }
+        @Override
+        public String toString() {
+            return type.tsym + " _";
+        }
+    }
+    record RecordPattern(Type recordType, int _hashCode, Type[] fullComponentTypes, PatternDescription... nested) implements PatternDescription {
+
+        public RecordPattern(Type recordType, Type[] fullComponentTypes, PatternDescription[] nested) {
+            this(recordType, hashCode(-1, recordType, nested), fullComponentTypes, nested);
+        }
+
+        @Override
+        public int hashCode() {
+            return _hashCode;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof RecordPattern other &&
+                    recordType.tsym == other.recordType.tsym &&
+                    Arrays.equals(nested, other.nested);
+        }
+
+        public int hashCode(int excludeComponent) {
+            return hashCode(excludeComponent, recordType, nested);
+        }
+
+        public static int hashCode(int excludeComponent, Type recordType, PatternDescription... nested) {
+            int hash = 5;
+            hash =  41 * hash + recordType.tsym.hashCode();
+            for (int  i = 0; i < nested.length; i++) {
+                if (i != excludeComponent) {
+                    hash = 41 * hash + nested[i].hashCode();
+                }
+            }
+            return hash;
+        }
+        @Override
+        public String toString() {
+            return recordType.tsym + "(" + Arrays.stream(nested)
+                    .map(pd -> pd.toString())
+                    .collect(Collectors.joining(", ")) + ")";
+        }
+    }
 }

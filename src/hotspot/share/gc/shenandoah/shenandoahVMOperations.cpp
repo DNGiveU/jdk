@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2013, 2018, Red Hat, Inc. All rights reserved.
+ * Copyright (c) 2013, 2021, Red Hat, Inc. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License version 2 only, as
@@ -23,9 +24,15 @@
 
 #include "precompiled.hpp"
 
+#include "gc/shenandoah/shenandoahConcurrentGC.hpp"
+#include "gc/shenandoah/shenandoahDegeneratedGC.hpp"
+#include "gc/shenandoah/shenandoahFullGC.hpp"
 #include "gc/shenandoah/shenandoahHeap.inline.hpp"
+#include "gc/shenandoah/shenandoahMark.inline.hpp"
+#include "gc/shenandoah/shenandoahOopClosures.inline.hpp"
 #include "gc/shenandoah/shenandoahUtils.hpp"
 #include "gc/shenandoah/shenandoahVMOperations.hpp"
+#include "interpreter/oopMapCache.hpp"
 #include "memory/universe.hpp"
 
 bool VM_ShenandoahReferenceOperation::doit_prologue() {
@@ -34,6 +41,7 @@ bool VM_ShenandoahReferenceOperation::doit_prologue() {
 }
 
 void VM_ShenandoahReferenceOperation::doit_epilogue() {
+  OopMapCache::cleanup_old_entries();
   if (Universe::has_reference_pending_list()) {
     Heap_lock->notify_all();
   }
@@ -41,46 +49,36 @@ void VM_ShenandoahReferenceOperation::doit_epilogue() {
 }
 
 void VM_ShenandoahInitMark::doit() {
-  ShenandoahGCPauseMark mark(_gc_id, SvcGCMarker::CONCURRENT);
-  ShenandoahHeap::heap()->entry_init_mark();
+  ShenandoahGCPauseMark mark(_gc_id, "Init Mark", SvcGCMarker::CONCURRENT);
+  _gc->entry_init_mark();
 }
 
 void VM_ShenandoahFinalMarkStartEvac::doit() {
-  ShenandoahGCPauseMark mark(_gc_id, SvcGCMarker::CONCURRENT);
-  ShenandoahHeap::heap()->entry_final_mark();
-}
-
-void VM_ShenandoahFinalEvac::doit() {
-  ShenandoahGCPauseMark mark(_gc_id, SvcGCMarker::CONCURRENT);
-  ShenandoahHeap::heap()->entry_final_evac();
+  ShenandoahGCPauseMark mark(_gc_id, "Final Mark", SvcGCMarker::CONCURRENT);
+  _gc->entry_final_mark();
 }
 
 void VM_ShenandoahFullGC::doit() {
-  ShenandoahGCPauseMark mark(_gc_id, SvcGCMarker::FULL);
-  ShenandoahHeap::heap()->entry_full(_gc_cause);
+  ShenandoahGCPauseMark mark(_gc_id, "Full GC", SvcGCMarker::FULL);
+  _full_gc->entry_full(_gc_cause);
 }
 
 void VM_ShenandoahDegeneratedGC::doit() {
-  ShenandoahGCPauseMark mark(_gc_id, SvcGCMarker::CONCURRENT);
-  ShenandoahHeap::heap()->entry_degenerated(_point);
-}
-
-void VM_ShenandoahInitTraversalGC::doit() {
-  ShenandoahGCPauseMark mark(_gc_id, SvcGCMarker::CONCURRENT);
-  ShenandoahHeap::heap()->entry_init_traversal();
-}
-
-void VM_ShenandoahFinalTraversalGC::doit() {
-  ShenandoahGCPauseMark mark(_gc_id, SvcGCMarker::CONCURRENT);
-  ShenandoahHeap::heap()->entry_final_traversal();
+  ShenandoahGCPauseMark mark(_gc_id, "Degenerated GC", SvcGCMarker::CONCURRENT);
+  _gc->entry_degenerated();
 }
 
 void VM_ShenandoahInitUpdateRefs::doit() {
-  ShenandoahGCPauseMark mark(_gc_id, SvcGCMarker::CONCURRENT);
-  ShenandoahHeap::heap()->entry_init_updaterefs();
+  ShenandoahGCPauseMark mark(_gc_id, "Init Update Refs", SvcGCMarker::CONCURRENT);
+  _gc->entry_init_updaterefs();
 }
 
 void VM_ShenandoahFinalUpdateRefs::doit() {
-  ShenandoahGCPauseMark mark(_gc_id, SvcGCMarker::CONCURRENT);
-  ShenandoahHeap::heap()->entry_final_updaterefs();
+  ShenandoahGCPauseMark mark(_gc_id, "Final Update Refs", SvcGCMarker::CONCURRENT);
+  _gc->entry_final_updaterefs();
+}
+
+void VM_ShenandoahFinalRoots::doit() {
+  ShenandoahGCPauseMark mark(_gc_id, "Final Roots", SvcGCMarker::CONCURRENT);
+  _gc->entry_final_roots();
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1999, 2011, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1999, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -37,8 +37,8 @@
  * array index.
  */
 
+#include <cmath> // ceil()
 #include <awt.h>
-#include <sun_awt_Win32GraphicsDevice.h>
 #include "awt_Canvas.h"
 #include "awt_Win32GraphicsDevice.h"
 #include "awt_Window.h"
@@ -46,7 +46,6 @@
 #include "java_awt_color_ColorSpace.h"
 #include "sun_awt_Win32GraphicsDevice.h"
 #include "java_awt_image_DataBuffer.h"
-#include "dither.h"
 #include "img_util_md.h"
 #include "Devices.h"
 #include "systemScale.h"
@@ -77,6 +76,7 @@ AwtWin32GraphicsDevice::AwtWin32GraphicsDevice(int screen,
     this->devicesArray = arr;
     this->scaleX = 1;
     this->scaleY = 1;
+    disableScaleAutoRefresh = FALSE;
     javaDevice = NULL;
     colorData = new ImgColorData;
     colorData->grayscale = GS_NOTGRAY;
@@ -405,7 +405,7 @@ jobject AwtWin32GraphicsDevice::GetColorModel(JNIEnv *env, jboolean dynamic)
                 vbits[sizeof(vbits)-1] = 0;
                 allvalid = JNI_FALSE;
             } else {
-                if (AwtPalette::UseCustomPalette() && !dynamic) {
+                if (!dynamic) {
                     // If we plan to use our custom palette (i.e., we are
                     // not running inside another app and we are not creating
                     // a dynamic colorModel object), then setup ICM with
@@ -577,7 +577,7 @@ void AwtWin32GraphicsDevice::RealizePalette(HDC hDC)
 }
 
 /**
- * Deterine which device the HWND exists on and return the
+ * Determine which device the HWND exists on and return the
  * appropriate index into the devices array.
  */
 int AwtWin32GraphicsDevice::DeviceIndexForWindow(HWND hWnd)
@@ -633,9 +633,21 @@ int AwtWin32GraphicsDevice::ScaleUpX(int x)
     return ClipRound(x * scaleX);
 }
 
+int AwtWin32GraphicsDevice::ScaleUpAbsX(int x)
+{
+    LONG screen = pMonitorInfo->rcMonitor.left;
+    return screen + ClipRound((x - screen) * scaleX);
+}
+
 int AwtWin32GraphicsDevice::ScaleUpY(int y)
 {
     return ClipRound(y * scaleY);
+}
+
+int AwtWin32GraphicsDevice::ScaleUpAbsY(int y)
+{
+    LONG screen = pMonitorInfo->rcMonitor.top;
+    return screen + ClipRound((y - screen) * scaleY);
 }
 
 int AwtWin32GraphicsDevice::ScaleDownX(int x)
@@ -643,9 +655,21 @@ int AwtWin32GraphicsDevice::ScaleDownX(int x)
     return ClipRound(x / scaleX);
 }
 
+int AwtWin32GraphicsDevice::ScaleDownAbsX(int x)
+{
+    LONG screen = pMonitorInfo->rcMonitor.left;
+    return screen + ClipRound((x - screen) / scaleX);
+}
+
 int AwtWin32GraphicsDevice::ScaleDownY(int y)
 {
     return ClipRound(y / scaleY);
+}
+
+int AwtWin32GraphicsDevice::ScaleDownAbsY(int y)
+{
+    LONG screen = pMonitorInfo->rcMonitor.top;
+    return screen + ClipRound((y - screen) / scaleY);
 }
 
 int AwtWin32GraphicsDevice::ClipRound(double value)
@@ -666,11 +690,13 @@ int AwtWin32GraphicsDevice::ClipRound(double value)
 
 void AwtWin32GraphicsDevice::InitDesktopScales()
 {
-    float dpiX = -1.0f;
-    float dpiY = -1.0f;
-    GetScreenDpi(GetMonitor(), &dpiX, &dpiY);
-    if (dpiX > 0 && dpiY > 0) {
-        SetScale(dpiX / 96, dpiY / 96);
+    if (!disableScaleAutoRefresh) {
+        float dpiX = -1.0f;
+        float dpiY = -1.0f;
+        GetScreenDpi(GetMonitor(), &dpiX, &dpiY);
+        if (dpiX > 0 && dpiY > 0) {
+            SetScale(dpiX / 96, dpiY / 96);
+        }
     }
 }
 
@@ -692,6 +718,11 @@ float AwtWin32GraphicsDevice::GetScaleY()
 void AwtWin32GraphicsDevice::DisableOffscreenAcceleration()
 {
     // REMIND: noop for now
+}
+
+void AwtWin32GraphicsDevice::DisableScaleAutoRefresh()
+{
+    disableScaleAutoRefresh = TRUE;
 }
 
 /**
@@ -751,6 +782,21 @@ void AwtWin32GraphicsDevice::ResetAllMonitorInfo()
         HMONITOR monitor = devices->GetDevice(deviceIndex)->GetMonitor();
         ::GetMonitorInfo(monitor,
                          devices->GetDevice(deviceIndex)->pMonitorInfo);
+    }
+}
+
+/**
+ * This function updates the scale factor for all monitors on the system.
+ */
+void AwtWin32GraphicsDevice::ResetAllDesktopScales()
+{
+    if (!Devices::GetInstance()){
+        return;
+    }
+    Devices::InstanceAccess devices;
+    int devicesNum = devices->GetNumDevices();
+    for (int deviceIndex = 0; deviceIndex < devicesNum; deviceIndex++) {
+        devices->GetDevice(deviceIndex)->InitDesktopScales();
     }
 }
 
@@ -852,7 +898,7 @@ BOOL AwtWin32GraphicsDevice::AreSameMonitors(HMONITOR mon1, HMONITOR mon2) {
     {
         if (::EqualRect(&mi1.rcMonitor, &mi2.rcMonitor) &&
             ::EqualRect(&mi1.rcWork, &mi2.rcWork) &&
-            (mi1.dwFlags  == mi1.dwFlags))
+            (mi1.dwFlags == mi2.dwFlags))
         {
 
             J2dTraceLn(J2D_TRACE_VERBOSE, "  the monitors are the same");
@@ -1393,6 +1439,7 @@ JNIEXPORT void JNICALL
     AwtWin32GraphicsDevice *device = devices->GetDevice(screen);
 
     if (device != NULL ) {
+        device->DisableScaleAutoRefresh();
         device->SetScale(scaleX, scaleY);
     }
 }
@@ -1441,4 +1488,3 @@ Java_sun_awt_Win32GraphicsDevice_initNativeScale
         device->InitDesktopScales();
     }
 }
-

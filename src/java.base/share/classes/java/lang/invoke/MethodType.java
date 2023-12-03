@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2008, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -33,7 +33,9 @@ import java.lang.ref.ReferenceQueue;
 import java.lang.ref.WeakReference;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.function.Supplier;
 import java.util.List;
+import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Optional;
@@ -42,6 +44,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Stream;
 
+import jdk.internal.util.ReferencedKeySet;
+import jdk.internal.util.ReferenceKey;
 import jdk.internal.vm.annotation.Stable;
 import sun.invoke.util.BytecodeDescriptor;
 import sun.invoke.util.VerifyType;
@@ -50,7 +54,6 @@ import sun.security.util.SecurityConstants;
 
 import static java.lang.invoke.MethodHandleStatics.UNSAFE;
 import static java.lang.invoke.MethodHandleStatics.newIllegalArgumentException;
-import static java.lang.invoke.MethodType.fromDescriptor;
 
 /**
  * A method type represents the arguments and return type accepted and
@@ -91,13 +94,44 @@ import static java.lang.invoke.MethodType.fromDescriptor;
  * A method type may be loaded by an {@code ldc} instruction which refers
  * to a suitable {@code CONSTANT_MethodType} constant pool entry.
  * The entry refers to a {@code CONSTANT_Utf8} spelling for the descriptor string.
- * (For full details on method type constants,
- * see sections 4.4.8 and 5.4.3.5 of the Java Virtual Machine Specification.)
+ * (For full details on method type constants, see sections {@jvms
+ * 4.4.8} and {@jvms 5.4.3.5} of the Java Virtual Machine
+ * Specification.)
  * <p>
  * When the JVM materializes a {@code MethodType} from a descriptor string,
  * all classes named in the descriptor must be accessible, and will be loaded.
  * (But the classes need not be initialized, as is the case with a {@code CONSTANT_Class}.)
  * This loading may occur at any time before the {@code MethodType} object is first derived.
+ * <p>
+ * <b><a id="descriptor">Nominal Descriptors</a></b>
+ * <p>
+ * A {@code MethodType} can be described in {@linkplain MethodTypeDesc nominal form}
+ * if and only if all of the parameter types and return type can be described
+ * with a {@link Class#describeConstable() nominal descriptor} represented by
+ * {@link ClassDesc}.  If a method type can be described nominally, then:
+ * <ul>
+ * <li>The method type has a {@link MethodTypeDesc nominal descriptor}
+ *     returned by {@link #describeConstable() MethodType::describeConstable}.</li>
+ * <li>The descriptor string returned by
+ *     {@link #descriptorString() MethodType::descriptorString} or
+ *     {@link #toMethodDescriptorString() MethodType::toMethodDescriptorString}
+ *     for the method type is a method descriptor (JVMS {@jvms 4.3.3}).</li>
+ * </ul>
+ * <p>
+ * If any of the parameter types or return type cannot be described
+ * nominally, i.e. {@link Class#describeConstable() Class::describeConstable}
+ * returns an empty optional for that type,
+ * then the method type cannot be described nominally:
+ * <ul>
+ * <li>The method type has no {@link MethodTypeDesc nominal descriptor} and
+ *     {@link #describeConstable() MethodType::describeConstable} returns
+ *     an empty optional.</li>
+ * <li>The descriptor string returned by
+ *     {@link #descriptorString() MethodType::descriptorString} or
+ *     {@link #toMethodDescriptorString() MethodType::toMethodDescriptorString}
+ *     for the method type is not a type descriptor.</li>
+ * </ul>
+ *
  * @author John Rose, JSR 292 EG
  * @since 1.7
  */
@@ -115,7 +149,8 @@ class MethodType
 
     // The remaining fields are caches of various sorts:
     private @Stable MethodTypeForm form; // erased form, plus cached data about primitives
-    private @Stable MethodType wrapAlt;  // alternative wrapped/unwrapped version
+    private @Stable Object wrapAlt;  // alternative wrapped/unwrapped version and
+                                     // private communication for readObject and readResolve
     private @Stable Invokers invokers;   // cache of handy higher-order adapters
     private @Stable String methodDescriptor;  // cache for toMethodDescriptorString
 
@@ -142,7 +177,8 @@ class MethodType
      *  {@code staticMethod(arg1, arg2, ..., arg255)} or
      *  {@code x.virtualMethod(arg1, arg2, ..., arg254)}.
      */
-    /*non-public*/ static final int MAX_JVM_ARITY = 255;  // this is mandated by the JVM spec.
+    /*non-public*/
+    static final int MAX_JVM_ARITY = 255;  // this is mandated by the JVM spec.
 
     /** This number is the maximum arity of a method handle, 254.
      *  It is derived from the absolute JVM-imposed arity by subtracting one,
@@ -152,7 +188,8 @@ class MethodType
      *  {@code mh.invoke(arg1, arg2, ..., arg254)}.
      */
     // Issue:  Should we allow MH.invokeWithArguments to go to the full 255?
-    /*non-public*/ static final int MAX_MH_ARITY = MAX_JVM_ARITY-1;  // deduct one for mh receiver
+    /*non-public*/
+    static final int MAX_MH_ARITY = MAX_JVM_ARITY-1;  // deduct one for mh receiver
 
     /** This number is the maximum arity of a method handle invoker, 253.
      *  It is derived from the absolute JVM-imposed arity by subtracting two,
@@ -162,21 +199,16 @@ class MethodType
      *  The longest possible invocation will look like
      *  {@code invokermh.invoke(targetmh, arg1, arg2, ..., arg253)}.
      */
-    /*non-public*/ static final int MAX_MH_INVOKER_ARITY = MAX_MH_ARITY-1;  // deduct one more for invoker
+    /*non-public*/
+    static final int MAX_MH_INVOKER_ARITY = MAX_MH_ARITY-1;  // deduct one more for invoker
 
-    private static void checkRtype(Class<?> rtype) {
-        Objects.requireNonNull(rtype);
-    }
-    private static void checkPtype(Class<?> ptype) {
-        Objects.requireNonNull(ptype);
-        if (ptype == void.class)
-            throw newIllegalArgumentException("parameter type cannot be void");
-    }
     /** Return number of extra slots (count of long/double args). */
     private static int checkPtypes(Class<?>[] ptypes) {
         int slots = 0;
         for (Class<?> ptype : ptypes) {
-            checkPtype(ptype);
+            Objects.requireNonNull(ptype);
+            if (ptype == void.class)
+                throw newIllegalArgumentException("parameter type cannot be void");
             if (ptype == double.class || ptype == long.class) {
                 slots++;
             }
@@ -198,7 +230,13 @@ class MethodType
         return new IndexOutOfBoundsException(num.toString());
     }
 
-    static final ConcurrentWeakInternSet<MethodType> internTable = new ConcurrentWeakInternSet<>();
+    static final ReferencedKeySet<MethodType> internTable =
+        ReferencedKeySet.create(false, true, new Supplier<>() {
+            @Override
+            public Map<ReferenceKey<MethodType>, ReferenceKey<MethodType>> get() {
+                return new ConcurrentHashMap<>(512);
+            }
+        });
 
     static final Class<?>[] NO_PTYPES = {};
 
@@ -210,9 +248,8 @@ class MethodType
      * @throws NullPointerException if {@code rtype} or {@code ptypes} or any element of {@code ptypes} is null
      * @throws IllegalArgumentException if any element of {@code ptypes} is {@code void.class}
      */
-    public static
-    MethodType methodType(Class<?> rtype, Class<?>[] ptypes) {
-        return makeImpl(rtype, ptypes, false);
+    public static MethodType methodType(Class<?> rtype, Class<?>[] ptypes) {
+        return methodType(rtype, ptypes, false);
     }
 
     /**
@@ -224,10 +261,9 @@ class MethodType
      * @throws NullPointerException if {@code rtype} or {@code ptypes} or any element of {@code ptypes} is null
      * @throws IllegalArgumentException if any element of {@code ptypes} is {@code void.class}
      */
-    public static
-    MethodType methodType(Class<?> rtype, List<Class<?>> ptypes) {
+    public static MethodType methodType(Class<?> rtype, List<Class<?>> ptypes) {
         boolean notrust = false;  // random List impl. could return evil ptypes array
-        return makeImpl(rtype, listToArray(ptypes), notrust);
+        return methodType(rtype, listToArray(ptypes), notrust);
     }
 
     private static Class<?>[] listToArray(List<Class<?>> ptypes) {
@@ -247,11 +283,24 @@ class MethodType
      * @throws NullPointerException if {@code rtype} or {@code ptype0} or {@code ptypes} or any element of {@code ptypes} is null
      * @throws IllegalArgumentException if {@code ptype0} or {@code ptypes} or any element of {@code ptypes} is {@code void.class}
      */
-    public static
-    MethodType methodType(Class<?> rtype, Class<?> ptype0, Class<?>... ptypes) {
-        Class<?>[] ptypes1 = new Class<?>[1+ptypes.length];
+    public static MethodType methodType(Class<?> rtype, Class<?> ptype0, Class<?>... ptypes) {
+        int len = ptypes.length;
+        if (rtype == Object.class && ptype0 == Object.class) {
+            if (len == 0) {
+                return genericMethodType(1, false);
+            }
+            if (isAllObject(ptypes, len - 1)) {
+                Class<?> lastParam = ptypes[len - 1];
+                if (lastParam == Object.class) {
+                    return genericMethodType(len + 1, false);
+                } else if (lastParam == Object[].class) {
+                    return genericMethodType(len, true);
+                }
+            }
+        }
+        Class<?>[] ptypes1 = new Class<?>[1 + len];
         ptypes1[0] = ptype0;
-        System.arraycopy(ptypes, 0, ptypes1, 1, ptypes.length);
+        System.arraycopy(ptypes, 0, ptypes1, 1, len);
         return makeImpl(rtype, ptypes1, true);
     }
 
@@ -263,8 +312,10 @@ class MethodType
      * @return a method type with the given return value
      * @throws NullPointerException if {@code rtype} is null
      */
-    public static
-    MethodType methodType(Class<?> rtype) {
+    public static MethodType methodType(Class<?> rtype) {
+        if (rtype == Object.class) {
+            return genericMethodType(0, false);
+        }
         return makeImpl(rtype, NO_PTYPES, true);
     }
 
@@ -278,8 +329,14 @@ class MethodType
      * @throws NullPointerException if {@code rtype} or {@code ptype0} is null
      * @throws IllegalArgumentException if {@code ptype0} is {@code void.class}
      */
-    public static
-    MethodType methodType(Class<?> rtype, Class<?> ptype0) {
+    public static MethodType methodType(Class<?> rtype, Class<?> ptype0) {
+        if (rtype == Object.class) {
+            if (ptype0 == Object.class) {
+                return genericMethodType(1, false);
+            } else if (ptype0 == Object[].class) {
+                return genericMethodType(0, true);
+            }
+        }
         return makeImpl(rtype, new Class<?>[]{ ptype0 }, true);
     }
 
@@ -293,20 +350,50 @@ class MethodType
      * @return a method type with the given components
      * @throws NullPointerException if {@code rtype} or {@code ptypes} is null
      */
-    public static
-    MethodType methodType(Class<?> rtype, MethodType ptypes) {
-        return makeImpl(rtype, ptypes.ptypes, true);
+    public static MethodType methodType(Class<?> rtype, MethodType ptypes) {
+        return methodType(rtype, ptypes.ptypes, true);
+    }
+
+    private static boolean isAllObject(Class<?>[] ptypes, int to) {
+        for (int i = 0; i < to; i++) {
+            if (ptypes[i] != Object.class) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /*trusted*/
+    static MethodType methodType(Class<?> rtype, Class<?>[] ptypes, boolean trusted) {
+        if (rtype == Object.class) {
+            int last = ptypes.length - 1;
+            if (last < 0) {
+                return genericMethodType(0, false);
+            }
+            if (isAllObject(ptypes, last)) {
+                Class<?> lastParam = ptypes[last];
+                if (lastParam == Object.class) {
+                    return genericMethodType(last + 1, false);
+                } else if (lastParam == Object[].class) {
+                    return genericMethodType(last, true);
+                }
+            }
+        }
+        return makeImpl(rtype, ptypes, trusted);
     }
 
     /**
-     * Sole factory method to find or create an interned method type.
+     * Sole factory method to find or create an interned method type. Will perform
+     * input validation on behalf of factory methods
+     *
      * @param rtype desired return type
      * @param ptypes desired parameter types
      * @param trusted whether the ptypes can be used without cloning
+     * @throws NullPointerException if {@code rtype} or {@code ptypes} or any element of {@code ptypes} is null
+     * @throws IllegalArgumentException if any element of {@code ptypes} is {@code void.class}
      * @return the unique method type of the desired structure
      */
-    /*trusted*/ static
-    MethodType makeImpl(Class<?> rtype, Class<?>[] ptypes, boolean trusted) {
+    private static MethodType makeImpl(Class<?> rtype, Class<?>[] ptypes, boolean trusted) {
         if (ptypes.length == 0) {
             ptypes = NO_PTYPES; trusted = true;
         }
@@ -316,7 +403,7 @@ class MethodType
             return mt;
 
         // promote the object to the Real Thing, and reprobe
-        MethodType.checkRtype(rtype);
+        Objects.requireNonNull(rtype);
         if (trusted) {
             MethodType.checkPtypes(ptypes);
             mt = primordialMT;
@@ -327,7 +414,7 @@ class MethodType
             mt = new MethodType(rtype, ptypes);
         }
         mt.form = MethodTypeForm.findForm(mt);
-        return internTable.add(mt);
+        return internTable.intern(mt);
     }
     private static final @Stable MethodType[] objectOnlyTypes = new MethodType[20];
 
@@ -342,8 +429,7 @@ class MethodType
      * @throws IllegalArgumentException if {@code objectArgCount} is negative or greater than 255 (or 254, if {@code finalArray} is true)
      * @see #genericMethodType(int)
      */
-    public static
-    MethodType genericMethodType(int objectArgCount, boolean finalArray) {
+    public static MethodType genericMethodType(int objectArgCount, boolean finalArray) {
         MethodType mt;
         checkSlotCount(objectArgCount);
         int ivarargs = (!finalArray ? 0 : 1);
@@ -371,8 +457,7 @@ class MethodType
      * @throws IllegalArgumentException if {@code objectArgCount} is negative or greater than 255
      * @see #genericMethodType(int, boolean)
      */
-    public static
-    MethodType genericMethodType(int objectArgCount) {
+    public static MethodType genericMethodType(int objectArgCount) {
         return genericMethodType(objectArgCount, false);
     }
 
@@ -388,7 +473,6 @@ class MethodType
      */
     public MethodType changeParameterType(int num, Class<?> nptype) {
         if (parameterType(num) == nptype)  return this;
-        checkPtype(nptype);
         Class<?>[] nptypes = ptypes.clone();
         nptypes[num] = nptype;
         return makeImpl(rtype, nptypes, true);
@@ -465,7 +549,7 @@ class MethodType
         return insertParameterTypes(parameterCount(), ptypesToInsert);
     }
 
-     /**
+    /**
      * Finds or creates a method type with modified parameter types.
      * Convenience method for {@link #methodType(java.lang.Class, java.lang.Class[]) methodType}.
      * @param start  the position (zero-based) of the first replaced parameter type(s)
@@ -479,7 +563,8 @@ class MethodType
      *                                  or if the resulting method type would have more than 255 parameter slots
      * @throws NullPointerException if {@code ptypesToInsert} or any of its elements is null
      */
-    /*non-public*/ MethodType replaceParameterTypes(int start, int end, Class<?>... ptypesToInsert) {
+    /*non-public*/
+    MethodType replaceParameterTypes(int start, int end, Class<?>... ptypesToInsert) {
         if (start == end)
             return insertParameterTypes(start, ptypesToInsert);
         int len = ptypes.length;
@@ -497,7 +582,8 @@ class MethodType
      * @param arrayLength the number of parameter types to change
      * @return the resulting type
      */
-    /*non-public*/ MethodType asSpreaderType(Class<?> arrayType, int pos, int arrayLength) {
+    /*non-public*/
+    MethodType asSpreaderType(Class<?> arrayType, int pos, int arrayLength) {
         assert(parameterCount() >= arrayLength);
         int spreadPos = pos;
         if (arrayLength == 0)  return this;  // nothing to change
@@ -527,7 +613,8 @@ class MethodType
     /** Return the leading parameter type, which must exist and be a reference.
      *  @return the leading parameter type, after error checks
      */
-    /*non-public*/ Class<?> leadingReferenceParameter() {
+    /*non-public*/
+    Class<?> leadingReferenceParameter() {
         Class<?> ptype;
         if (ptypes.length == 0 ||
             (ptype = ptypes[0]).isPrimitive())
@@ -541,7 +628,8 @@ class MethodType
      * @param arrayLength the number of parameter types to insert
      * @return the resulting type
      */
-    /*non-public*/ MethodType asCollectorType(Class<?> arrayType, int pos, int arrayLength) {
+    /*non-public*/
+    MethodType asCollectorType(Class<?> arrayType, int pos, int arrayLength) {
         assert(parameterCount() >= 1);
         assert(pos < ptypes.length);
         assert(ptypes[pos].isAssignableFrom(arrayType));
@@ -601,7 +689,7 @@ class MethodType
                 System.arraycopy(ptypes, end, nptypes, start, tail);
             }
         }
-        return makeImpl(rtype, nptypes, true);
+        return methodType(rtype, nptypes, true);
     }
 
     /**
@@ -613,7 +701,7 @@ class MethodType
      */
     public MethodType changeReturnType(Class<?> nrtype) {
         if (returnType() == nrtype)  return this;
-        return makeImpl(nrtype, ptypes, true);
+        return methodType(nrtype, ptypes, true);
     }
 
     /**
@@ -652,7 +740,8 @@ class MethodType
      * such as {@link MethodHandle#invokeBasic invokeBasic}.
      * @return a version of the original type with all reference and subword types replaced
      */
-    /*non-public*/ MethodType basicType() {
+    /*non-public*/
+    MethodType basicType() {
         return form.basicType();
     }
 
@@ -662,7 +751,8 @@ class MethodType
     /**
      * @return a version of the original type with MethodHandle prepended as the first argument
      */
-    /*non-public*/ MethodType invokerType() {
+    /*non-public*/
+    MethodType invokerType() {
         return insertParameterTypes(0, METHOD_HANDLE_ARRAY);
     }
 
@@ -677,7 +767,8 @@ class MethodType
         return genericMethodType(parameterCount());
     }
 
-    /*non-public*/ boolean isGeneric() {
+    /*non-public*/
+    boolean isGeneric() {
         return this == erase() && !hasPrimitives();
     }
 
@@ -708,10 +799,10 @@ class MethodType
 
     private static MethodType wrapWithPrims(MethodType pt) {
         assert(pt.hasPrimitives());
-        MethodType wt = pt.wrapAlt;
+        MethodType wt = (MethodType)pt.wrapAlt;
         if (wt == null) {
             // fill in lazily
-            wt = MethodTypeForm.canonicalize(pt, MethodTypeForm.WRAP, MethodTypeForm.WRAP);
+            wt = MethodTypeForm.canonicalize(pt, MethodTypeForm.WRAP);
             assert(wt != null);
             pt.wrapAlt = wt;
         }
@@ -720,10 +811,10 @@ class MethodType
 
     private static MethodType unwrapWithNoPrims(MethodType wt) {
         assert(!wt.hasPrimitives());
-        MethodType uwt = wt.wrapAlt;
+        MethodType uwt = (MethodType)wt.wrapAlt;
         if (uwt == null) {
             // fill in lazily
-            uwt = MethodTypeForm.canonicalize(wt, MethodTypeForm.UNWRAP, MethodTypeForm.UNWRAP);
+            uwt = MethodTypeForm.canonicalize(wt, MethodTypeForm.UNWRAP);
             if (uwt == null)
                 uwt = wt;    // type has no wrappers or prims at all
             wt.wrapAlt = uwt;
@@ -761,7 +852,7 @@ class MethodType
      * @return the parameter types (as an immutable list)
      */
     public List<Class<?>> parameterList() {
-        return Collections.unmodifiableList(Arrays.asList(ptypes.clone()));
+        return List.of(ptypes);
     }
 
     /**
@@ -801,23 +892,13 @@ class MethodType
      * @param x object to compare
      * @see Object#equals(Object)
      */
-    // This implementation may also return true if x is a WeakEntry containing
-    // a method type that is equal to this. This is an internal implementation
-    // detail to allow for faster method type lookups.
-    // See ConcurrentWeakInternSet.WeakEntry#equals(Object)
     @Override
     public boolean equals(Object x) {
         if (this == x) {
             return true;
         }
-        if (x instanceof MethodType) {
-            return equals((MethodType)x);
-        }
-        if (x instanceof ConcurrentWeakInternSet.WeakEntry) {
-            Object o = ((ConcurrentWeakInternSet.WeakEntry)x).get();
-            if (o instanceof MethodType) {
-                return equals((MethodType)o);
-            }
+        if (x instanceof MethodType mt) {
+            return equals(mt);
         }
         return false;
     }
@@ -1064,11 +1145,13 @@ class MethodType
      * generate bytecodes that process method handles and invokedynamic.
      * @return the number of JVM stack slots for this type's parameters
      */
-    /*non-public*/ int parameterSlotCount() {
+    /*non-public*/
+    int parameterSlotCount() {
         return form.parameterSlotCount();
     }
 
-    /*non-public*/ Invokers invokers() {
+    /*non-public*/
+    Invokers invokers() {
         Invokers inv = invokers;
         if (inv != null)  return inv;
         invokers = inv = new Invokers(this);
@@ -1076,31 +1159,35 @@ class MethodType
     }
 
     /**
-     * Finds or creates an instance of a method type, given the spelling of its bytecode descriptor.
-     * Convenience method for {@link #methodType(java.lang.Class, java.lang.Class[]) methodType}.
+     * Finds or creates an instance of a method type of the given method descriptor
+     * (JVMS {@jvms 4.3.3}). This method is a convenience method for
+     * {@link #methodType(java.lang.Class, java.lang.Class[]) methodType}.
      * Any class or interface name embedded in the descriptor string will be
-     * resolved by the given loader (or if it is null, on the system class loader).
-     * <p>
-     * Note that it is possible to encounter method types which cannot be
-     * constructed by this method, because their component types are
-     * not all reachable from a common class loader.
+     * resolved by the given loader (or if it is {@code null}, on the system class loader).
+     *
+     * @apiNote
+     * It is possible to encounter method types that have valid descriptors but
+     * cannot be constructed by this method, because their component types are
+     * not visible from a common class loader.
      * <p>
      * This method is included for the benefit of applications that must
      * generate bytecodes that process method handles and {@code invokedynamic}.
-     * @param descriptor a bytecode-level type descriptor string "(T...)T"
+     * @param descriptor a method descriptor string
      * @param loader the class loader in which to look up the types
-     * @return a method type matching the bytecode-level type descriptor
-     * @throws NullPointerException if the string is null
-     * @throws IllegalArgumentException if the string is not well-formed
+     * @return a method type of the given method descriptor
+     * @throws NullPointerException if the string is {@code null}
+     * @throws IllegalArgumentException if the string is not a method descriptor
      * @throws TypeNotPresentException if a named type cannot be found
      * @throws SecurityException if the security manager is present and
      *         {@code loader} is {@code null} and the caller does not have the
      *         {@link RuntimePermission}{@code ("getClassLoader")}
+     * @jvms 4.3.3 Method Descriptors
      */
     public static MethodType fromMethodDescriptorString(String descriptor, ClassLoader loader)
         throws IllegalArgumentException, TypeNotPresentException
     {
         if (loader == null) {
+            @SuppressWarnings("removal")
             SecurityManager sm = System.getSecurityManager();
             if (sm != null) {
                 sm.checkPermission(SecurityConstants.GET_CLASSLOADER_PERMISSION);
@@ -1130,21 +1217,26 @@ class MethodType
         List<Class<?>> types = BytecodeDescriptor.parseMethod(descriptor, loader);
         Class<?> rtype = types.remove(types.size() - 1);
         Class<?>[] ptypes = listToArray(types);
-        return makeImpl(rtype, ptypes, true);
+        return methodType(rtype, ptypes, true);
     }
 
     /**
-     * Produces a bytecode descriptor representation of the method type.
-     * <p>
-     * Note that this is not a strict inverse of {@link #fromMethodDescriptorString fromMethodDescriptorString}.
-     * Two distinct classes which share a common name but have different class loaders
-     * will appear identical when viewed within descriptor strings.
+     * {@return the descriptor string for this method type} This method
+     * is equivalent to calling {@link #descriptorString() MethodType::descriptorString}.
+     *
+     * @apiNote
+     * This is not a strict inverse of {@link #fromMethodDescriptorString
+     * fromMethodDescriptorString} which requires a method type descriptor
+     * (JVMS {@jvms 4.3.3}) and a suitable class loader argument.
+     * Two distinct {@code MethodType} objects can have an identical
+     * descriptor string as distinct classes can have the same name
+     * but different class loaders.
+     *
      * <p>
      * This method is included for the benefit of applications that must
      * generate bytecodes that process method handles and {@code invokedynamic}.
-     * {@link #fromMethodDescriptorString(java.lang.String, java.lang.ClassLoader) fromMethodDescriptorString},
-     * because the latter requires a suitable class loader argument.
-     * @return the bytecode type descriptor representation
+     * @jvms 4.3.3 Method Descriptors
+     * @see <a href="#descriptor">Nominal Descriptor for {@code MethodType}</a>
      */
     public String toMethodDescriptorString() {
         String desc = methodDescriptor;
@@ -1156,28 +1248,46 @@ class MethodType
     }
 
     /**
-     * Return a field type descriptor string for this type
+     * {@return the descriptor string for this method type}
      *
-     * @return the descriptor string
-     * @jvms 4.3.2 Field Descriptors
+     * <p>
+     * If this method type can be {@linkplain ##descriptor described nominally},
+     * then the result is a method type descriptor (JVMS {@jvms 4.3.3}).
+     * {@link MethodTypeDesc MethodTypeDesc} for this method type
+     * can be produced by calling {@link MethodTypeDesc#ofDescriptor(String)
+     * MethodTypeDesc::ofDescriptor} with the result descriptor string.
+     * <p>
+     * If this method type cannot be {@linkplain ##descriptor described nominally}
+     * and the result is a string of the form:
+     * <blockquote>{@code "(<parameter-descriptors>)<return-descriptor>"}</blockquote>
+     * where {@code <parameter-descriptors>} is the concatenation of the
+     * {@linkplain Class#descriptorString() descriptor string} of all
+     * of the parameter types and the {@linkplain Class#descriptorString() descriptor string}
+     * of the return type. No {@link java.lang.constant.MethodTypeDesc MethodTypeDesc}
+     * can be produced from the result string.
+     *
      * @since 12
+     * @jvms 4.3.3 Method Descriptors
+     * @see <a href="#descriptor">Nominal Descriptor for {@code MethodType}</a>
      */
     @Override
     public String descriptorString() {
         return toMethodDescriptorString();
     }
 
-    /*non-public*/ static String toFieldDescriptorString(Class<?> cls) {
+    /*non-public*/
+    static String toFieldDescriptorString(Class<?> cls) {
         return BytecodeDescriptor.unparse(cls);
     }
 
     /**
-     * Return a nominal descriptor for this instance, if one can be
+     * Returns a nominal descriptor for this instance, if one can be
      * constructed, or an empty {@link Optional} if one cannot be.
      *
      * @return An {@link Optional} containing the resulting nominal descriptor,
      * or an empty {@link Optional} if one cannot be constructed.
      * @since 12
+     * @see <a href="#descriptor">Nominal Descriptor for {@code MethodType}</a>
      */
     @Override
     public Optional<MethodTypeDesc> describeConstable() {
@@ -1242,27 +1352,18 @@ s.writeObject(this.parameterArray());
      */
     @java.io.Serial
     private void readObject(java.io.ObjectInputStream s) throws java.io.IOException, ClassNotFoundException {
-        // Assign temporary defaults in case this object escapes
-        MethodType_init(void.class, NO_PTYPES);
+        // Assign defaults in case this object escapes
+        UNSAFE.putReference(this, OffsetHolder.rtypeOffset, void.class);
+        UNSAFE.putReference(this, OffsetHolder.ptypesOffset, NO_PTYPES);
 
         s.defaultReadObject();  // requires serialPersistentFields to be an empty array
 
         Class<?>   returnType     = (Class<?>)   s.readObject();
         Class<?>[] parameterArray = (Class<?>[]) s.readObject();
-        parameterArray = parameterArray.clone();  // make sure it is unshared
 
-        // Assign deserialized values
-        MethodType_init(returnType, parameterArray);
-    }
-
-    // Initialization of state for deserialization only
-    private void MethodType_init(Class<?> rtype, Class<?>[] ptypes) {
-        // In order to communicate these values to readResolve, we must
-        // store them into the implementation-specific final fields.
-        checkRtype(rtype);
-        checkPtypes(ptypes);
-        UNSAFE.putReference(this, OffsetHolder.rtypeOffset, rtype);
-        UNSAFE.putReference(this, OffsetHolder.ptypesOffset, ptypes);
+        // Verify all operands, and make sure ptypes is unshared
+        // Cache the new MethodType for readResolve
+        wrapAlt = new MethodType[]{MethodType.methodType(returnType, parameterArray)};
     }
 
     // Support for resetting final fields while deserializing. Implement Holder
@@ -1285,119 +1386,9 @@ s.writeObject(this.parameterArray());
         // Do not use a trusted path for deserialization:
         //    return makeImpl(rtype, ptypes, true);
         // Verify all operands, and make sure ptypes is unshared:
-        try {
-            return methodType(rtype, ptypes);
-        } finally {
-            // Re-assign defaults in case this object escapes
-            MethodType_init(void.class, NO_PTYPES);
-        }
+        // Return a new validated MethodType for the rtype and ptypes passed from readObject.
+        MethodType mt = ((MethodType[])wrapAlt)[0];
+        wrapAlt = null;
+        return mt;
     }
-
-    /**
-     * Simple implementation of weak concurrent intern set.
-     *
-     * @param <T> interned type
-     */
-    private static class ConcurrentWeakInternSet<T> {
-
-        private final ConcurrentMap<WeakEntry<T>, WeakEntry<T>> map;
-        private final ReferenceQueue<T> stale;
-
-        public ConcurrentWeakInternSet() {
-            this.map = new ConcurrentHashMap<>(512);
-            this.stale = new ReferenceQueue<>();
-        }
-
-        /**
-         * Get the existing interned element.
-         * This method returns null if no element is interned.
-         *
-         * @param elem element to look up
-         * @return the interned element
-         */
-        public T get(T elem) {
-            if (elem == null) throw new NullPointerException();
-            expungeStaleElements();
-
-            WeakEntry<T> value = map.get(elem);
-            if (value != null) {
-                T res = value.get();
-                if (res != null) {
-                    return res;
-                }
-            }
-            return null;
-        }
-
-        /**
-         * Interns the element.
-         * Always returns non-null element, matching the one in the intern set.
-         * Under the race against another add(), it can return <i>different</i>
-         * element, if another thread beats us to interning it.
-         *
-         * @param elem element to add
-         * @return element that was actually added
-         */
-        public T add(T elem) {
-            if (elem == null) throw new NullPointerException();
-
-            // Playing double race here, and so spinloop is required.
-            // First race is with two concurrent updaters.
-            // Second race is with GC purging weak ref under our feet.
-            // Hopefully, we almost always end up with a single pass.
-            T interned;
-            WeakEntry<T> e = new WeakEntry<>(elem, stale);
-            do {
-                expungeStaleElements();
-                WeakEntry<T> exist = map.putIfAbsent(e, e);
-                interned = (exist == null) ? elem : exist.get();
-            } while (interned == null);
-            return interned;
-        }
-
-        private void expungeStaleElements() {
-            Reference<? extends T> reference;
-            while ((reference = stale.poll()) != null) {
-                map.remove(reference);
-            }
-        }
-
-        private static class WeakEntry<T> extends WeakReference<T> {
-
-            public final int hashcode;
-
-            public WeakEntry(T key, ReferenceQueue<T> queue) {
-                super(key, queue);
-                hashcode = key.hashCode();
-            }
-
-            /**
-             * This implementation returns {@code true} if {@code obj} is another
-             * {@code WeakEntry} whose referent is equals to this referent, or
-             * if {@code obj} is equals to the referent of this. This allows
-             * lookups to be made without wrapping in a {@code WeakEntry}.
-             *
-             * @param obj the object to compare
-             * @return true if {@code obj} is equals to this or the referent of this
-             * @see MethodType#equals(Object)
-             * @see Object#equals(Object)
-             */
-            @Override
-            public boolean equals(Object obj) {
-                Object mine = get();
-                if (obj instanceof WeakEntry) {
-                    Object that = ((WeakEntry) obj).get();
-                    return (that == null || mine == null) ? (this == obj) : mine.equals(that);
-                }
-                return (mine == null) ? (obj == null) : mine.equals(obj);
-            }
-
-            @Override
-            public int hashCode() {
-                return hashcode;
-            }
-
-        }
-    }
-
 }

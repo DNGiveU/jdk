@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2000, 2020, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,8 +24,8 @@
 
 package sun.jvm.hotspot.oops;
 
-import java.util.Observable;
-import java.util.Observer;
+import sun.jvm.hotspot.utilities.Observable;
+import sun.jvm.hotspot.utilities.Observer;
 
 import sun.jvm.hotspot.debugger.Address;
 import sun.jvm.hotspot.runtime.VM;
@@ -58,8 +58,8 @@ public class CompressedKlassPointers {
   private static synchronized void initialize(TypeDataBase db) {
     Type type = db.lookupType("CompressedKlassPointers");
 
-    baseField = type.getAddressField("_narrow_klass._base");
-    shiftField = type.getCIntegerField("_narrow_klass._shift");
+    baseField = type.getAddressField("_base");
+    shiftField = type.getCIntegerField("_shift");
   }
 
   public CompressedKlassPointers() {

@@ -31,7 +31,11 @@ import tests.Helper;
  * @library ../../lib
  * @library /test/lib
  * @modules java.base/jdk.internal.jimage
- *          jdk.jdeps/com.sun.tools.classfile
+ *          java.base/jdk.internal.classfile
+ *          java.base/jdk.internal.classfile.attribute
+ *          java.base/jdk.internal.classfile.constantpool
+ *          java.base/jdk.internal.classfile.instruction
+ *          java.base/jdk.internal.classfile.components
  *          jdk.jlink/jdk.tools.jlink.internal
  *          jdk.jlink/jdk.tools.jmod
  *          jdk.jlink/jdk.tools.jimage
@@ -83,6 +87,7 @@ public class VendorInfoPluginsTest {
                             + (System.getProperty("os.name").startsWith("Windows")
                                ? ".exe" : "")).toString();
         var oa = ProcessTools.executeProcess(launcher,
+                                             "-Xmx64m",
                                              "-XshowSettings:properties",
                                              "--version");
         oa.stderrShouldMatch("^ +java.vendor.url.bug = " + BUG_URL + "$");
@@ -92,6 +97,8 @@ public class VendorInfoPluginsTest {
 
         // VM error log
         oa = ProcessTools.executeProcess(launcher,
+                                         "-Xmx64m",
+                                         "-XX:-CreateCoredumpOnCrash",
                                          "--class-path",
                                          System.getProperty("test.classes"),
                                          "VendorInfoPluginsTest$Crasher");

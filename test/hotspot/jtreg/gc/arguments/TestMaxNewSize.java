@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2013, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2013, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,46 +25,46 @@ package gc.arguments;
 
 /*
  * @test TestMaxNewSizeSerial
- * @key gc
  * @bug 7057939
  * @summary Make sure that MaxNewSize always has a useful value after argument
  * processing.
- * @requires vm.gc.Serial
+ * @key flag-sensitive
+ * @requires vm.gc.Serial & vm.opt.MaxNewSize == null & vm.opt.NewRatio == null & vm.opt.NewSize == null & vm.opt.OldSize == null & vm.opt.x.Xms == null & vm.opt.x.Xmx == null
  * @library /test/lib
  * @library /
  * @modules java.base/jdk.internal.misc
  *          java.management
- * @run main gc.arguments.TestMaxNewSize -XX:+UseSerialGC
+ * @run driver gc.arguments.TestMaxNewSize -XX:+UseSerialGC
  * @author thomas.schatzl@oracle.com, jesper.wilhelmsson@oracle.com
  */
 
 /*
  * @test TestMaxNewSizeParallel
- * @key gc
  * @bug 7057939
  * @summary Make sure that MaxNewSize always has a useful value after argument
  * processing.
- * @requires vm.gc.Parallel
+ * @key flag-sensitive
+ * @requires vm.gc.Parallel & vm.opt.MaxNewSize == null & vm.opt.NewRatio == null & vm.opt.NewSize == null & vm.opt.OldSize == null & vm.opt.x.Xms == null & vm.opt.x.Xmx == null
  * @library /test/lib
  * @library /
  * @modules java.base/jdk.internal.misc
  *          java.management
- * @run main gc.arguments.TestMaxNewSize -XX:+UseParallelGC
+ * @run driver gc.arguments.TestMaxNewSize -XX:+UseParallelGC
  * @author thomas.schatzl@oracle.com, jesper.wilhelmsson@oracle.com
  */
 
 /*
  * @test TestMaxNewSizeG1
- * @key gc
  * @bug 7057939
  * @summary Make sure that MaxNewSize always has a useful value after argument
  * processing.
- * @requires vm.gc.G1
+ * @key flag-sensitive
+ * @requires vm.gc.G1 & vm.opt.MaxNewSize == null & vm.opt.NewRatio == null & vm.opt.NewSize == null & vm.opt.OldSize == null & vm.opt.x.Xms == null & vm.opt.x.Xmx == null
  * @library /test/lib
  * @library /
  * @modules java.base/jdk.internal.misc
  *          java.management
- * @run main gc.arguments.TestMaxNewSize -XX:+UseG1GC
+ * @run driver gc.arguments.TestMaxNewSize -XX:+UseG1GC
  * @author thomas.schatzl@oracle.com, jesper.wilhelmsson@oracle.com
  */
 
@@ -77,52 +77,28 @@ import java.util.ArrayList;
 import java.util.Arrays;
 
 import jdk.test.lib.process.OutputAnalyzer;
-import jdk.test.lib.process.ProcessTools;
 
 public class TestMaxNewSize {
 
   private static void checkMaxNewSize(String[] flags, int heapsize) throws Exception {
     BigInteger actual = new BigInteger(getMaxNewSize(flags));
-    System.out.println(actual);
-    if (actual.compareTo(new BigInteger((new Long(heapsize)).toString())) == 1) {
+    System.out.println("asserting: " + actual + " <= " + heapsize);
+    if (actual.compareTo(new BigInteger("" + heapsize)) > 0) {
       throw new RuntimeException("MaxNewSize value set to \"" + actual +
         "\", expected otherwise when running with the following flags: " + Arrays.asList(flags).toString());
     }
   }
 
-  private static void checkIncompatibleNewSize(String[] flags) throws Exception {
-    ArrayList<String> finalargs = new ArrayList<String>();
-    finalargs.addAll(Arrays.asList(flags));
-    finalargs.add("-version");
-
-    ProcessBuilder pb = GCArguments.createJavaProcessBuilder(finalargs.toArray(new String[0]));
-    OutputAnalyzer output = new OutputAnalyzer(pb.start());
-    output.shouldContain("Initial young gen size set larger than the maximum young gen size");
-  }
-
-  private static boolean isRunningG1(String[] args) {
-    for (int i = 0; i < args.length; i++) {
-      if (args[i].contains("+UseG1GC")) {
-        return true;
-      }
-    }
-    return false;
-  }
-
   private static String getMaxNewSize(String[] flags) throws Exception {
     ArrayList<String> finalargs = new ArrayList<String>();
     finalargs.addAll(Arrays.asList(flags));
-    if (isRunningG1(flags)) {
-      finalargs.add("-XX:G1HeapRegionSize=1M");
-    }
     finalargs.add("-XX:+PrintFlagsFinal");
     finalargs.add("-version");
 
-    ProcessBuilder pb = GCArguments.createJavaProcessBuilder(finalargs.toArray(new String[0]));
+    ProcessBuilder pb = GCArguments.createTestJavaProcessBuilder(finalargs);
     OutputAnalyzer output = new OutputAnalyzer(pb.start());
     output.shouldHaveExitValue(0);
     String stdout = output.getStdout();
-    //System.out.println(stdout);
     return getFlagValue("MaxNewSize", stdout);
   }
 

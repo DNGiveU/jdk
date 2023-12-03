@@ -1,6 +1,6 @@
 /*
- * Copyright (c) 1999, 2019, Oracle and/or its affiliates. All rights reserved.
- * Copyright (c) 2012, 2019 SAP SE. All rights reserved.
+ * Copyright (c) 1999, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2023 SAP SE. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,59 +28,66 @@
 #pragma alloca
 
 // no precompiled headers
-#include "jvm.h"
-#include "classfile/classLoader.hpp"
-#include "classfile/systemDictionary.hpp"
 #include "classfile/vmSymbols.hpp"
 #include "code/icBuffer.hpp"
 #include "code/vtableStubs.hpp"
 #include "compiler/compileBroker.hpp"
 #include "interpreter/interpreter.hpp"
-#include "logging/log.hpp"
-#include "logging/logStream.hpp"
+#include "jvm.h"
+#include "jvmtifiles/jvmti.h"
 #include "libo4.hpp"
 #include "libperfstat_aix.hpp"
 #include "libodm_aix.hpp"
 #include "loadlib_aix.hpp"
+#include "logging/log.hpp"
+#include "logging/logStream.hpp"
 #include "memory/allocation.inline.hpp"
-#include "memory/filemap.hpp"
 #include "misc_aix.hpp"
 #include "oops/oop.inline.hpp"
 #include "os_aix.inline.hpp"
-#include "os_share_aix.hpp"
+#include "os_posix.hpp"
 #include "porting_aix.hpp"
 #include "prims/jniFastGetField.hpp"
 #include "prims/jvm_misc.hpp"
 #include "runtime/arguments.hpp"
 #include "runtime/atomic.hpp"
-#include "runtime/extendedPC.hpp"
 #include "runtime/globals.hpp"
+#include "runtime/globals_extension.hpp"
 #include "runtime/interfaceSupport.inline.hpp"
 #include "runtime/java.hpp"
 #include "runtime/javaCalls.hpp"
+#include "runtime/javaThread.hpp"
 #include "runtime/mutexLocker.hpp"
 #include "runtime/objectMonitor.hpp"
-#include "runtime/orderAccess.hpp"
 #include "runtime/os.hpp"
+#include "runtime/osInfo.hpp"
 #include "runtime/osThread.hpp"
 #include "runtime/perfMemory.hpp"
+#include "runtime/safefetch.hpp"
 #include "runtime/sharedRuntime.hpp"
 #include "runtime/statSampler.hpp"
-#include "runtime/stubRoutines.hpp"
-#include "runtime/thread.inline.hpp"
 #include "runtime/threadCritical.hpp"
+#include "runtime/threads.hpp"
 #include "runtime/timer.hpp"
 #include "runtime/vm_version.hpp"
 #include "services/attachListener.hpp"
 #include "services/runtimeService.hpp"
+#include "signals_posix.hpp"
 #include "utilities/align.hpp"
+#include "utilities/checkedCast.hpp"
 #include "utilities/decoder.hpp"
 #include "utilities/defaultStream.hpp"
 #include "utilities/events.hpp"
 #include "utilities/growableArray.hpp"
 #include "utilities/vmError.hpp"
+#if INCLUDE_JFR
+#include "jfr/support/jfrNativeLibraryLoadEvent.hpp"
+#endif
 
 // put OS-includes here (sorted alphabetically)
+#ifdef AIX_XLC_GE_17
+#include <alloca.h>
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -109,7 +116,6 @@
 #include <sys/types.h>
 #include <sys/utsname.h>
 #include <sys/vminfo.h>
-#include <sys/wait.h>
 
 // Missing prototypes for various system APIs.
 extern "C"
@@ -162,7 +168,6 @@ static void vmembk_print_on(outputStream* os);
 julong    os::Aix::_physical_memory = 0;
 
 pthread_t os::Aix::_main_thread = ((pthread_t)0);
-int       os::Aix::_page_size = -1;
 
 // -1 = uninitialized, 0 if AIX, 1 if OS/400 pase
 int       os::Aix::_on_pase = -1;
@@ -185,15 +190,9 @@ int       os::Aix::_extshm = -1;
 // local variables
 
 static volatile jlong max_real_time = 0;
-static jlong    initial_time_count = 0;
-static int      clock_tics_per_sec = 100;
-static sigset_t check_signal_done;         // For diagnostics to print a message once (see run_periodic_checks)
-static bool     check_signals      = true;
-static int      SR_signum          = SIGUSR2; // Signal used to suspend/resume a thread (must be > SIGSEGV, see 4355769)
-static sigset_t SR_sigset;
 
 // Process break recorded at startup.
-static address g_brk_at_startup = NULL;
+static address g_brk_at_startup = nullptr;
 
 // This describes the state of multipage support of the underlying
 // OS. Note that this is of no interest to the outsize world and
@@ -245,12 +244,16 @@ static struct {
 // a specific wish address, e.g. to place the heap in a
 // compressed-oops-friendly way.
 static bool is_close_to_brk(address a) {
-  assert0(g_brk_at_startup != NULL);
+  assert0(g_brk_at_startup != nullptr);
   if (a >= g_brk_at_startup &&
       a < (g_brk_at_startup + MaxExpectedDataSegmentSize)) {
     return true;
   }
   return false;
+}
+
+julong os::free_memory() {
+  return Aix::available_memory();
 }
 
 julong os::available_memory() {
@@ -274,18 +277,6 @@ julong os::physical_memory() {
   return Aix::physical_memory();
 }
 
-// Return true if user is running as root.
-
-bool os::have_special_privileges() {
-  static bool init = false;
-  static bool privileges = false;
-  if (!init) {
-    privileges = (getuid() != geteuid()) || (getgid() != getegid());
-    init = true;
-  }
-  return privileges;
-}
-
 // Helper function, emulates disclaim64 using multiple 32bit disclaims
 // because we cannot use disclaim64() on AS/400 and old AIX releases.
 static bool my_disclaim64(char* addr, size_t size) {
@@ -302,7 +293,7 @@ static bool my_disclaim64(char* addr, size_t size) {
 
   char* p = addr;
 
-  for (int i = 0; i < numFullDisclaimsNeeded; i ++) {
+  for (unsigned int i = 0; i < numFullDisclaimsNeeded; i ++) {
     if (::disclaim(p, maxDisclaimSize, DISCLAIM_ZEROMEM) != 0) {
       trcVerbose("Cannot disclaim %p - %p (errno %d)\n", p, p + maxDisclaimSize, errno);
       return false;
@@ -387,7 +378,7 @@ static const char* describe_pagesize(size_t pagesize) {
 // Must be called before calling os::large_page_init().
 static void query_multipage_support() {
 
-  guarantee(g_multipage_support.pagesize == -1,
+  guarantee(g_multipage_support.pagesize == (size_t)-1,
             "do not call twice");
 
   g_multipage_support.pagesize = ::sysconf(_SC_PAGESIZE);
@@ -411,8 +402,8 @@ static void query_multipage_support() {
   {
     const int shmid = ::shmget(IPC_PRIVATE, 1, IPC_CREAT | S_IRUSR | S_IWUSR);
     guarantee(shmid != -1, "shmget failed");
-    void* p = ::shmat(shmid, NULL, 0);
-    ::shmctl(shmid, IPC_RMID, NULL);
+    void* p = ::shmat(shmid, nullptr, 0);
+    ::shmctl(shmid, IPC_RMID, nullptr);
     guarantee(p != (void*) -1, "shmat failed");
     g_multipage_support.shmpsize = os::Aix::query_pagesize(p);
     ::shmdt(p);
@@ -477,20 +468,20 @@ static void query_multipage_support() {
         IPC_CREAT | S_IRUSR | S_IWUSR);
       guarantee0(shmid != -1); // Should always work.
       // Try to set pagesize.
-      struct shmid_ds shm_buf = { 0 };
+      struct shmid_ds shm_buf = { };
       shm_buf.shm_pagesize = pagesize;
       if (::shmctl(shmid, SHM_PAGESIZE, &shm_buf) != 0) {
         const int en = errno;
-        ::shmctl(shmid, IPC_RMID, NULL); // As early as possible!
+        ::shmctl(shmid, IPC_RMID, nullptr); // As early as possible!
         trcVerbose("shmctl(SHM_PAGESIZE) failed with errno=%d", errno);
       } else {
         // Attach and double check pageisze.
-        void* p = ::shmat(shmid, NULL, 0);
-        ::shmctl(shmid, IPC_RMID, NULL); // As early as possible!
+        void* p = ::shmat(shmid, nullptr, 0);
+        ::shmctl(shmid, IPC_RMID, nullptr); // As early as possible!
         guarantee0(p != (void*) -1); // Should always work.
         const size_t real_pagesize = os::Aix::query_pagesize(p);
         if (real_pagesize != pagesize) {
-          trcVerbose("real page size (" SIZE_FORMAT_HEX ") differs.", real_pagesize);
+          trcVerbose("real page size (" SIZE_FORMAT_X ") differs.", real_pagesize);
         } else {
           can_use = true;
         }
@@ -543,7 +534,7 @@ void os::init_system_properties_values() {
 #endif
 #define EXTENSIONS_DIR  "/lib/ext"
 
-  // Buffer that fits several sprintfs.
+  // Buffer that fits several snprintfs.
   // Note that the space for the trailing null is provided
   // by the nulls included by the sizeof operator.
   const size_t bufsize =
@@ -559,24 +550,24 @@ void os::init_system_properties_values() {
     // Found the full path to libjvm.so.
     // Now cut the path to <java_home>/jre if we can.
     pslash = strrchr(buf, '/');
-    if (pslash != NULL) {
+    if (pslash != nullptr) {
       *pslash = '\0';            // Get rid of /libjvm.so.
     }
     pslash = strrchr(buf, '/');
-    if (pslash != NULL) {
+    if (pslash != nullptr) {
       *pslash = '\0';            // Get rid of /{client|server|hotspot}.
     }
     Arguments::set_dll_dir(buf);
 
-    if (pslash != NULL) {
+    if (pslash != nullptr) {
       pslash = strrchr(buf, '/');
-      if (pslash != NULL) {
+      if (pslash != nullptr) {
         *pslash = '\0';        // Get rid of /lib.
       }
     }
     Arguments::set_java_home(buf);
     if (!set_boot_path('/', ':')) {
-      vm_exit_during_initialization("Failed setting boot class path.", NULL);
+      vm_exit_during_initialization("Failed setting boot class path.", nullptr);
     }
   }
 
@@ -587,17 +578,18 @@ void os::init_system_properties_values() {
   // Get the user setting of LIBPATH.
   const char *v = ::getenv("LIBPATH");
   const char *v_colon = ":";
-  if (v == NULL) { v = ""; v_colon = ""; }
+  if (v == nullptr) { v = ""; v_colon = ""; }
 
   // Concatenate user and invariant part of ld_library_path.
   // That's +1 for the colon and +1 for the trailing '\0'.
-  char *ld_library_path = NEW_C_HEAP_ARRAY(char, strlen(v) + 1 + sizeof(DEFAULT_LIBPATH) + 1, mtInternal);
-  sprintf(ld_library_path, "%s%s" DEFAULT_LIBPATH, v, v_colon);
+  size_t pathsize = strlen(v) + 1 + sizeof(DEFAULT_LIBPATH) + 1;
+  char *ld_library_path = NEW_C_HEAP_ARRAY(char, pathsize, mtInternal);
+  os::snprintf_checked(ld_library_path, pathsize, "%s%s" DEFAULT_LIBPATH, v, v_colon);
   Arguments::set_library_path(ld_library_path);
   FREE_C_HEAP_ARRAY(char, ld_library_path);
 
   // Extensions directories.
-  sprintf(buf, "%s" EXTENSIONS_DIR, Arguments::get_java_home());
+  os::snprintf_checked(buf, bufsize, "%s" EXTENSIONS_DIR, Arguments::get_java_home());
   Arguments::set_ext_dirs(buf);
 
   FREE_C_HEAP_ARRAY(char, buf);
@@ -615,90 +607,6 @@ void os::breakpoint() {
 
 extern "C" void breakpoint() {
   // use debugger to set breakpoint here
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// signal support
-
-debug_only(static bool signal_sets_initialized = false);
-static sigset_t unblocked_sigs, vm_sigs;
-
-void os::Aix::signal_sets_init() {
-  // Should also have an assertion stating we are still single-threaded.
-  assert(!signal_sets_initialized, "Already initialized");
-  // Fill in signals that are necessarily unblocked for all threads in
-  // the VM. Currently, we unblock the following signals:
-  // SHUTDOWN{1,2,3}_SIGNAL: for shutdown hooks support (unless over-ridden
-  //                         by -Xrs (=ReduceSignalUsage));
-  // BREAK_SIGNAL which is unblocked only by the VM thread and blocked by all
-  // other threads. The "ReduceSignalUsage" boolean tells us not to alter
-  // the dispositions or masks wrt these signals.
-  // Programs embedding the VM that want to use the above signals for their
-  // own purposes must, at this time, use the "-Xrs" option to prevent
-  // interference with shutdown hooks and BREAK_SIGNAL thread dumping.
-  // (See bug 4345157, and other related bugs).
-  // In reality, though, unblocking these signals is really a nop, since
-  // these signals are not blocked by default.
-  sigemptyset(&unblocked_sigs);
-  sigaddset(&unblocked_sigs, SIGILL);
-  sigaddset(&unblocked_sigs, SIGSEGV);
-  sigaddset(&unblocked_sigs, SIGBUS);
-  sigaddset(&unblocked_sigs, SIGFPE);
-  sigaddset(&unblocked_sigs, SIGTRAP);
-  sigaddset(&unblocked_sigs, SR_signum);
-
-  if (!ReduceSignalUsage) {
-   if (!os::Posix::is_sig_ignored(SHUTDOWN1_SIGNAL)) {
-     sigaddset(&unblocked_sigs, SHUTDOWN1_SIGNAL);
-   }
-   if (!os::Posix::is_sig_ignored(SHUTDOWN2_SIGNAL)) {
-     sigaddset(&unblocked_sigs, SHUTDOWN2_SIGNAL);
-   }
-   if (!os::Posix::is_sig_ignored(SHUTDOWN3_SIGNAL)) {
-     sigaddset(&unblocked_sigs, SHUTDOWN3_SIGNAL);
-   }
-  }
-  // Fill in signals that are blocked by all but the VM thread.
-  sigemptyset(&vm_sigs);
-  if (!ReduceSignalUsage)
-    sigaddset(&vm_sigs, BREAK_SIGNAL);
-  debug_only(signal_sets_initialized = true);
-}
-
-// These are signals that are unblocked while a thread is running Java.
-// (For some reason, they get blocked by default.)
-sigset_t* os::Aix::unblocked_signals() {
-  assert(signal_sets_initialized, "Not initialized");
-  return &unblocked_sigs;
-}
-
-// These are the signals that are blocked while a (non-VM) thread is
-// running Java. Only the VM thread handles these signals.
-sigset_t* os::Aix::vm_signals() {
-  assert(signal_sets_initialized, "Not initialized");
-  return &vm_sigs;
-}
-
-void os::Aix::hotspot_sigmask(Thread* thread) {
-
-  //Save caller's signal mask before setting VM signal mask
-  sigset_t caller_sigmask;
-  pthread_sigmask(SIG_BLOCK, NULL, &caller_sigmask);
-
-  OSThread* osthread = thread->osthread();
-  osthread->set_caller_sigmask(caller_sigmask);
-
-  pthread_sigmask(SIG_UNBLOCK, os::Aix::unblocked_signals(), NULL);
-
-  if (!ReduceSignalUsage) {
-    if (thread->is_VM_thread()) {
-      // Only the VM thread handles BREAK_SIGNAL ...
-      pthread_sigmask(SIG_UNBLOCK, vm_signals(), NULL);
-    } else {
-      // ... all other threads block BREAK_SIGNAL
-      pthread_sigmask(SIG_BLOCK, vm_signals(), NULL);
-    }
-  }
 }
 
 // retrieve memory information.
@@ -739,7 +647,7 @@ bool os::Aix::get_meminfo(meminfo_t* pmi) {
 
     perfstat_memory_total_t psmt;
     memset (&psmt, '\0', sizeof(psmt));
-    const int rc = libperfstat::perfstat_memory_total(NULL, &psmt, sizeof(psmt), 1);
+    const int rc = libperfstat::perfstat_memory_total(nullptr, &psmt, sizeof(psmt), 1);
     if (rc == -1) {
       trcVerbose("perfstat_memory_total() failed (errno=%d)", errno);
       assert(0, "perfstat_memory_total() failed");
@@ -820,7 +728,7 @@ static void *thread_native_entry(Thread *thread) {
   osthread->set_kernel_thread_id(kernel_thread_id);
 
   // Initialize signal mask for this thread.
-  os::Aix::hotspot_sigmask(thread);
+  PosixSignals::hotspot_sigmask(thread);
 
   // Initialize floating point control register.
   os::Aix::init_thread_fpu_state();
@@ -832,7 +740,7 @@ static void *thread_native_entry(Thread *thread) {
 
   // Note: at this point the thread object may already have deleted itself.
   // Prevent dereferencing it from here on out.
-  thread = NULL;
+  thread = nullptr;
 
   log_info(os, thread)("Thread finished (tid: " UINTX_FORMAT ", kernel thread id: " UINTX_FORMAT ").",
     os::current_thread_id(), (uintx) kernel_thread_id);
@@ -843,11 +751,11 @@ static void *thread_native_entry(Thread *thread) {
 bool os::create_thread(Thread* thread, ThreadType thr_type,
                        size_t req_stack_size) {
 
-  assert(thread->osthread() == NULL, "caller responsible");
+  assert(thread->osthread() == nullptr, "caller responsible");
 
   // Allocate the OSThread object.
-  OSThread* osthread = new OSThread(NULL, NULL);
-  if (osthread == NULL) {
+  OSThread* osthread = new (std::nothrow) OSThread();
+  if (osthread == nullptr) {
     return false;
   }
 
@@ -861,7 +769,8 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
 
   // Init thread attributes.
   pthread_attr_t attr;
-  pthread_attr_init(&attr);
+  int rslt = pthread_attr_init(&attr);
+  guarantee(rslt == 0, "pthread_attr_init has to return 0");
   guarantee(pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED) == 0, "???");
 
   // Make sure we run in 1:1 kernel-user-thread mode.
@@ -879,7 +788,7 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
   // JDK-8187028: It was observed that on some configurations (4K backed thread stacks)
   // the real thread stack size may be smaller than the requested stack size, by as much as 64K.
   // This very much looks like a pthread lib error. As a workaround, increase the stack size
-  // by 64K for small thread stacks (arbitrarily choosen to be < 4MB)
+  // by 64K for small thread stacks (arbitrarily chosen to be < 4MB)
   if (stack_size < 4096 * K) {
     stack_size += 64 * K;
   }
@@ -893,8 +802,9 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
     log_warning(os, thread)("The %sthread stack size specified is invalid: " SIZE_FORMAT "k",
                             (thr_type == compiler_thread) ? "compiler " : ((thr_type == java_thread) ? "" : "VM "),
                             stack_size / K);
-    thread->set_osthread(NULL);
+    thread->set_osthread(nullptr);
     delete osthread;
+    pthread_attr_destroy(&attr);
     return false;
   }
 
@@ -905,21 +815,27 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
     ret = pthread_attr_setguardsize(&attr, 0);
   }
 
+  ResourceMark rm;
   pthread_t tid = 0;
+
   if (ret == 0) {
-    ret = pthread_create(&tid, &attr, (void* (*)(void*)) thread_native_entry, thread);
+    int limit = 3;
+    do {
+      ret = pthread_create(&tid, &attr, (void* (*)(void*)) thread_native_entry, thread);
+    } while (ret == EAGAIN && limit-- > 0);
   }
 
   if (ret == 0) {
     char buf[64];
-    log_info(os, thread)("Thread started (pthread id: " UINTX_FORMAT ", attributes: %s). ",
-      (uintx) tid, os::Posix::describe_pthread_attr(buf, sizeof(buf), &attr));
+    log_info(os, thread)("Thread \"%s\" started (pthread id: " UINTX_FORMAT ", attributes: %s). ",
+                         thread->name(), (uintx) tid, os::Posix::describe_pthread_attr(buf, sizeof(buf), &attr));
   } else {
     char buf[64];
-    log_warning(os, thread)("Failed to start thread - pthread_create failed (%d=%s) for attributes: %s.",
-      ret, os::errno_name(ret), os::Posix::describe_pthread_attr(buf, sizeof(buf), &attr));
+    log_warning(os, thread)("Failed to start thread \"%s\" - pthread_create failed (%d=%s) for attributes: %s.",
+                            thread->name(), ret, os::errno_name(ret), os::Posix::describe_pthread_attr(buf, sizeof(buf), &attr));
     // Log some OS information which might explain why creating the thread failed.
-    log_info(os, thread)("Number of threads approx. running in the VM: %d", Threads::number_of_threads());
+    log_warning(os, thread)("Number of threads approx. running in the VM: %d", Threads::number_of_threads());
+    log_warning(os, thread)("Checking JVM parameter MaxExpectedDataSegmentSize (currently " SIZE_FORMAT "k)  might be helpful", MaxExpectedDataSegmentSize/K);
     LogStream st(Log(os, thread)::info());
     os::Posix::print_rlimit_info(&st);
     os::print_memory_info(&st);
@@ -929,7 +845,7 @@ bool os::create_thread(Thread* thread, ThreadType thr_type,
 
   if (ret != 0) {
     // Need to clean up stuff we've allocated so far.
-    thread->set_osthread(NULL);
+    thread->set_osthread(nullptr);
     delete osthread;
     return false;
   }
@@ -955,9 +871,9 @@ bool os::create_attached_thread(JavaThread* thread) {
 #endif
 
   // Allocate the OSThread object
-  OSThread* osthread = new OSThread(NULL, NULL);
+  OSThread* osthread = new (std::nothrow) OSThread();
 
-  if (osthread == NULL) {
+  if (osthread == nullptr) {
     return false;
   }
 
@@ -987,10 +903,12 @@ bool os::create_attached_thread(JavaThread* thread) {
 
   // initialize signal mask for this thread
   // and save the caller's signal mask
-  os::Aix::hotspot_sigmask(thread);
+  PosixSignals::hotspot_sigmask(thread);
 
-  log_info(os, thread)("Thread attached (tid: " UINTX_FORMAT ", kernel thread id: " UINTX_FORMAT ").",
-    os::current_thread_id(), (uintx) kernel_thread_id);
+  log_info(os, thread)("Thread attached (tid: " UINTX_FORMAT ", kernel thread  id: " UINTX_FORMAT
+                       ", stack: " PTR_FORMAT " - " PTR_FORMAT " (" SIZE_FORMAT "K) ).",
+                       os::current_thread_id(), (uintx) kernel_thread_id,
+                       p2i(thread->stack_base()), p2i(thread->stack_end()), thread->stack_size() / K);
 
   return true;
 }
@@ -1002,7 +920,7 @@ void os::pd_start_thread(Thread* thread) {
 
 // Free OS resources related to the OSThread
 void os::free_thread(OSThread* osthread) {
-  assert(osthread != NULL, "osthread not set");
+  assert(osthread != nullptr, "osthread not set");
 
   // We are told to free resources of the argument thread,
   // but we can only really operate on the current thread.
@@ -1011,29 +929,13 @@ void os::free_thread(OSThread* osthread) {
 
   // Restore caller's signal mask
   sigset_t sigmask = osthread->caller_sigmask();
-  pthread_sigmask(SIG_SETMASK, &sigmask, NULL);
+  pthread_sigmask(SIG_SETMASK, &sigmask, nullptr);
 
   delete osthread;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 // time support
-
-// Time since start-up in seconds to a fine granularity.
-// Used by VMSelfDestructTimer and the MemProfiler.
-double os::elapsedTime() {
-  return ((double)os::elapsed_counter()) / os::elapsed_frequency(); // nanosecond resolution
-}
-
-jlong os::elapsed_counter() {
-  return javaTimeNanos() - initial_time_count;
-}
-
-jlong os::elapsed_frequency() {
-  return NANOSECS_PER_SEC; // nanosecond resolution
-}
-
-bool os::supports_vtime() { return true; }
 
 double os::elapsedVTime() {
   struct rusage usage;
@@ -1044,21 +946,6 @@ double os::elapsedVTime() {
     // better than nothing, but not much
     return elapsedTime();
   }
-}
-
-jlong os::javaTimeMillis() {
-  timeval time;
-  int status = gettimeofday(&time, NULL);
-  assert(status != -1, "aix error at gettimeofday()");
-  return jlong(time.tv_sec) * 1000 + jlong(time.tv_usec / 1000);
-}
-
-void os::javaTimeSystemUTC(jlong &seconds, jlong &nanos) {
-  timeval time;
-  int status = gettimeofday(&time, NULL);
-  assert(status != -1, "aix error at gettimeofday()");
-  seconds = jlong(time.tv_sec);
-  nanos = jlong(time.tv_usec) * 1000;
 }
 
 // We use mread_real_time here.
@@ -1084,7 +971,7 @@ jlong os::javaTimeNanos() {
     if (now <= prev) {
       return prev;   // same or retrograde time;
     }
-    jlong obsv = Atomic::cmpxchg(now, &max_real_time, prev);
+    jlong obsv = Atomic::cmpxchg(&max_real_time, prev, now);
     assert(obsv >= prev, "invariant");   // Monotonicity
     // If the CAS succeeded then we're done and return "now".
     // If the CAS failed and the observed value "obsv" is >= now then
@@ -1116,97 +1003,6 @@ void os::javaTimeNanos_info(jvmtiTimerInfo *info_ptr) {
   info_ptr->kind = JVMTI_TIMER_ELAPSED;    // elapsed not CPU time
 }
 
-// Return the real, user, and system times in seconds from an
-// arbitrary fixed point in the past.
-bool os::getTimesSecs(double* process_real_time,
-                      double* process_user_time,
-                      double* process_system_time) {
-  struct tms ticks;
-  clock_t real_ticks = times(&ticks);
-
-  if (real_ticks == (clock_t) (-1)) {
-    return false;
-  } else {
-    double ticks_per_second = (double) clock_tics_per_sec;
-    *process_user_time = ((double) ticks.tms_utime) / ticks_per_second;
-    *process_system_time = ((double) ticks.tms_stime) / ticks_per_second;
-    *process_real_time = ((double) real_ticks) / ticks_per_second;
-
-    return true;
-  }
-}
-
-char * os::local_time_string(char *buf, size_t buflen) {
-  struct tm t;
-  time_t long_time;
-  time(&long_time);
-  localtime_r(&long_time, &t);
-  jio_snprintf(buf, buflen, "%d-%02d-%02d %02d:%02d:%02d",
-               t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-               t.tm_hour, t.tm_min, t.tm_sec);
-  return buf;
-}
-
-struct tm* os::localtime_pd(const time_t* clock, struct tm* res) {
-  return localtime_r(clock, res);
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// runtime exit support
-
-// Note: os::shutdown() might be called very early during initialization, or
-// called from signal handler. Before adding something to os::shutdown(), make
-// sure it is async-safe and can handle partially initialized VM.
-void os::shutdown() {
-
-  // allow PerfMemory to attempt cleanup of any persistent resources
-  perfMemory_exit();
-
-  // needs to remove object in file system
-  AttachListener::abort();
-
-  // flush buffered output, finish log files
-  ostream_abort();
-
-  // Check for abort hook
-  abort_hook_t abort_hook = Arguments::abort_hook();
-  if (abort_hook != NULL) {
-    abort_hook();
-  }
-}
-
-// Note: os::abort() might be called very early during initialization, or
-// called from signal handler. Before adding something to os::abort(), make
-// sure it is async-safe and can handle partially initialized VM.
-void os::abort(bool dump_core, void* siginfo, const void* context) {
-  os::shutdown();
-  if (dump_core) {
-#ifndef PRODUCT
-    fdStream out(defaultStream::output_fd());
-    out.print_raw("Current thread is ");
-    char buf[16];
-    jio_snprintf(buf, sizeof(buf), UINTX_FORMAT, os::current_thread_id());
-    out.print_raw_cr(buf);
-    out.print_raw_cr("Dumping core ...");
-#endif
-    ::abort(); // dump core
-  }
-
-  ::exit(1);
-}
-
-// Die immediately, no exit hook, no abort hook, no cleanup.
-// Dump a core file, if possible, for debugging.
-void os::die() {
-  if (TestUnresponsiveErrorHandler && !CreateCoredumpOnCrash) {
-    // For TimeoutInErrorHandlingTest.java, we just kill the VM
-    // and don't take the time to generate a core file.
-    os::signal_raise(SIGKILL);
-  } else {
-    ::abort();
-  }
-}
-
 intx os::current_thread_id() {
   return (intx)pthread_self();
 }
@@ -1217,11 +1013,13 @@ int os::current_process_id() {
 
 // DLL functions
 
-const char* os::dll_file_extension() { return ".so"; }
-
 // This must be hard coded because it's the system's temporary
 // directory not the java application's temp directory, ala java.io.tmpdir.
 const char* os::get_temp_directory() { return "/tmp"; }
+
+void os::prepare_native_symbols() {
+  LoadedLibraries::reload();
+}
 
 // Check if addr is inside libjvm.so.
 bool os::address_is_in_vm(address addr) {
@@ -1229,9 +1027,9 @@ bool os::address_is_in_vm(address addr) {
   // Input could be a real pc or a function pointer literal. The latter
   // would be a function descriptor residing in the data segment of a module.
   loaded_module_t lm;
-  if (LoadedLibraries::find_for_text_address(addr, &lm) != NULL) {
+  if (LoadedLibraries::find_for_text_address(addr, &lm)) {
     return lm.is_in_vm;
-  } else if (LoadedLibraries::find_for_data_address(addr, &lm) != NULL) {
+  } else if (LoadedLibraries::find_for_data_address(addr, &lm)) {
     return lm.is_in_vm;
   } else {
     return false;
@@ -1245,22 +1043,22 @@ bool os::address_is_in_vm(address addr) {
 // If the input is a valid AIX function descriptor, it is resolved to the
 //   code entry point.
 // If the input is neither a valid function descriptor nor a valid code pointer,
-//   NULL is returned.
+//   null is returned.
 static address resolve_function_descriptor_to_code_pointer(address p) {
 
-  if (LoadedLibraries::find_for_text_address(p, NULL) != NULL) {
+  if (LoadedLibraries::find_for_text_address(p, nullptr)) {
     // It is a real code pointer.
     return p;
-  } else if (LoadedLibraries::find_for_data_address(p, NULL) != NULL) {
+  } else if (LoadedLibraries::find_for_data_address(p, nullptr)) {
     // Pointer to data segment, potential function descriptor.
     address code_entry = (address)(((FunctionDescriptor*)p)->entry());
-    if (LoadedLibraries::find_for_text_address(code_entry, NULL) != NULL) {
+    if (LoadedLibraries::find_for_text_address(code_entry, nullptr)) {
       // It is a function descriptor.
       return code_entry;
     }
   }
 
-  return NULL;
+  return nullptr;
 }
 
 bool os::dll_address_to_function_name(address addr, char *buf,
@@ -1270,7 +1068,7 @@ bool os::dll_address_to_function_name(address addr, char *buf,
     *offset = -1;
   }
   // Buf is not optional, but offset is optional.
-  assert(buf != NULL, "sanity check");
+  assert(buf != nullptr, "sanity check");
   buf[0] = '\0';
 
   // Resolve function ptr literals first.
@@ -1279,7 +1077,7 @@ bool os::dll_address_to_function_name(address addr, char *buf,
     return false;
   }
 
-  return AixSymbols::get_function_name(addr, buf, buflen, offset, NULL, demangle);
+  return AixSymbols::get_function_name(addr, buf, buflen, offset, nullptr, demangle);
 }
 
 bool os::dll_address_to_library_name(address addr, char* buf,
@@ -1288,7 +1086,7 @@ bool os::dll_address_to_library_name(address addr, char* buf,
     *offset = -1;
   }
   // Buf is not optional, but offset is optional.
-  assert(buf != NULL, "sanity check");
+  assert(buf != nullptr, "sanity check");
   buf[0] = '\0';
 
   // Resolve function ptr literals first.
@@ -1297,11 +1095,19 @@ bool os::dll_address_to_library_name(address addr, char* buf,
     return false;
   }
 
-  return AixSymbols::get_module_name(addr, buf, buflen);
+  address  base = nullptr;
+  if (!AixSymbols::get_module_name_and_base(addr, buf, buflen, &base)
+      || base == nullptr) {
+    return false;
+  }
+  assert(addr >= base && addr <= base + INT_MAX, "address not in library text range");
+  if (offset != nullptr) {
+    *offset = addr - base;
+  }
+
+  return true;
 }
 
-// Loads .dll/.so and in case of error it checks if .dll/.so was built
-// for the same architecture as Hotspot is running on.
 void *os::dll_load(const char *filename, char *ebuf, int ebuflen) {
 
   log_info(os)("attempting shared library load of %s", filename);
@@ -1313,13 +1119,24 @@ void *os::dll_load(const char *filename, char *ebuf, int ebuflen) {
 
   if (!filename || strlen(filename) == 0) {
     ::strncpy(ebuf, "dll_load: empty filename specified", ebuflen - 1);
-    return NULL;
+    return nullptr;
   }
 
-  // RTLD_LAZY is currently not implemented. The dl is loaded immediately with all its dependants.
-  void * result= ::dlopen(filename, RTLD_LAZY);
-  if (result != NULL) {
-    Events::log(NULL, "Loaded shared library %s", filename);
+  // RTLD_LAZY has currently the same behavior as RTLD_NOW
+  // The dl is loaded immediately with all its dependants.
+  int dflags = RTLD_LAZY;
+  // check for filename ending with ')', it indicates we want to load
+  // a MEMBER module that is a member of an archive.
+  int flen = strlen(filename);
+  if (flen > 0 && filename[flen - 1] == ')') {
+    dflags |= RTLD_MEMBER;
+  }
+
+  void* result;
+  JFR_ONLY(NativeLibraryLoadEvent load_event(filename, &result);)
+  result = ::dlopen(filename, dflags);
+  if (result != nullptr) {
+    Events::log_dll_message(nullptr, "Loaded shared library %s", filename);
     // Reload dll cache. Don't do this in signal handling.
     LoadedLibraries::reload();
     log_info(os)("shared library load of %s was successful", filename);
@@ -1327,26 +1144,18 @@ void *os::dll_load(const char *filename, char *ebuf, int ebuflen) {
   } else {
     // error analysis when dlopen fails
     const char* error_report = ::dlerror();
-    if (error_report == NULL) {
+    if (error_report == nullptr) {
       error_report = "dlerror returned no error description";
     }
-    if (ebuf != NULL && ebuflen > 0) {
+    if (ebuf != nullptr && ebuflen > 0) {
       snprintf(ebuf, ebuflen - 1, "%s, LIBPATH=%s, LD_LIBRARY_PATH=%s : %s",
                filename, ::getenv("LIBPATH"), ::getenv("LD_LIBRARY_PATH"), error_report);
     }
-    Events::log(NULL, "Loading shared library %s failed, %s", filename, error_report);
+    Events::log_dll_message(nullptr, "Loading shared library %s failed, %s", filename, error_report);
     log_info(os)("shared library load of %s failed, %s", filename, error_report);
+    JFR_ONLY(load_event.set_error_msg(error_report);)
   }
-  return NULL;
-}
-
-void* os::dll_lookup(void* handle, const char* name) {
-  void* res = dlsym(handle, name);
-  return res;
-}
-
-void* os::get_default_process_handle() {
-  return (void*)::dlopen(NULL, RTLD_LAZY);
+  return nullptr;
 }
 
 void os::print_dll_info(outputStream *st) {
@@ -1362,7 +1171,11 @@ void os::get_summary_os_info(char* buf, size_t buflen) {
 }
 
 int os::get_loaded_modules_info(os::LoadedModulesCallbackFunc callback, void *param) {
-  // Not yet implemented.
+
+  if (!LoadedLibraries::for_each(callback, param)) {
+    return -1;
+  }
+
   return 0;
 }
 
@@ -1377,13 +1190,15 @@ void os::print_os_info_brief(outputStream* st) {
 }
 
 void os::print_os_info(outputStream* st) {
-  st->print("OS:");
+  st->print_cr("OS:");
 
   os::Posix::print_uname_info(st);
 
   uint32_t ver = os::Aix::os_version();
   st->print_cr("AIX kernel version %u.%u.%u.%u",
                (ver >> 24) & 0xFF, (ver >> 16) & 0xFF, (ver >> 8) & 0xFF, ver & 0xFF);
+
+  os::Posix::print_uptime_info(st);
 
   os::Posix::print_rlimit_info(st);
 
@@ -1533,28 +1348,6 @@ void os::pd_print_cpu_info(outputStream* st, char* buf, size_t buflen) {
   // Nothing to do beyond of what os::print_cpu_info() does.
 }
 
-static void print_signal_handler(outputStream* st, int sig,
-                                 char* buf, size_t buflen);
-
-void os::print_signal_handlers(outputStream* st, char* buf, size_t buflen) {
-  st->print_cr("Signal Handlers:");
-  print_signal_handler(st, SIGSEGV, buf, buflen);
-  print_signal_handler(st, SIGBUS , buf, buflen);
-  print_signal_handler(st, SIGFPE , buf, buflen);
-  print_signal_handler(st, SIGPIPE, buf, buflen);
-  print_signal_handler(st, SIGXFSZ, buf, buflen);
-  print_signal_handler(st, SIGILL , buf, buflen);
-  print_signal_handler(st, SR_signum, buf, buflen);
-  print_signal_handler(st, SHUTDOWN1_SIGNAL, buf, buflen);
-  print_signal_handler(st, SHUTDOWN2_SIGNAL , buf, buflen);
-  print_signal_handler(st, SHUTDOWN3_SIGNAL , buf, buflen);
-  print_signal_handler(st, BREAK_SIGNAL, buf, buflen);
-  print_signal_handler(st, SIGTRAP, buf, buflen);
-  // We also want to know if someone else adds a SIGDANGER handler because
-  // that will interfere with OOM killling.
-  print_signal_handler(st, SIGDANGER, buf, buflen);
-}
-
 static char saved_jvm_path[MAXPATHLEN] = {0};
 
 // Find the full path to the current module, libjvm.so.
@@ -1575,7 +1368,7 @@ void os::jvm_path(char *buf, jint buflen) {
   int ret = dladdr(CAST_FROM_FN_PTR(void *, os::jvm_path), &dlinfo);
   assert(ret != 0, "cannot locate libjvm");
   char* rp = os::Posix::realpath((char *)dlinfo.dli_fname, buf, buflen);
-  assert(rp != NULL, "error in realpath(): maybe the 'path' argument is too long?");
+  assert(rp != nullptr, "error in realpath(): maybe the 'path' argument is too long?");
 
   if (Arguments::sun_java_launcher_is_altjvm()) {
     // Support for the java launcher's '-XXaltjvm=<path>' option. Typical
@@ -1594,19 +1387,19 @@ void os::jvm_path(char *buf, jint buflen) {
     if (strncmp(p, "/jre/lib/", 9) != 0) {
       // Look for JAVA_HOME in the environment.
       char* java_home_var = ::getenv("JAVA_HOME");
-      if (java_home_var != NULL && java_home_var[0] != 0) {
+      if (java_home_var != nullptr && java_home_var[0] != 0) {
         char* jrelib_p;
         int len;
 
         // Check the current module name "libjvm.so".
         p = strrchr(buf, '/');
-        if (p == NULL) {
+        if (p == nullptr) {
           return;
         }
         assert(strstr(p, "/libjvm") == p, "invalid library name");
 
         rp = os::Posix::realpath(java_home_var, buf, buflen);
-        if (rp == NULL) {
+        if (rp == nullptr) {
           return;
         }
 
@@ -1627,7 +1420,7 @@ void os::jvm_path(char *buf, jint buflen) {
         } else {
           // Go back to path of .so
           rp = os::Posix::realpath((char *)dlinfo.dli_fname, buf, buflen);
-          if (rp == NULL) {
+          if (rp == nullptr) {
             return;
           }
         }
@@ -1637,197 +1430,6 @@ void os::jvm_path(char *buf, jint buflen) {
 
   strncpy(saved_jvm_path, buf, sizeof(saved_jvm_path));
   saved_jvm_path[sizeof(saved_jvm_path) - 1] = '\0';
-}
-
-void os::print_jni_name_prefix_on(outputStream* st, int args_size) {
-  // no prefix required, not even "_"
-}
-
-void os::print_jni_name_suffix_on(outputStream* st, int args_size) {
-  // no suffix required
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// sun.misc.Signal support
-
-static void
-UserHandler(int sig, void *siginfo, void *context) {
-  // Ctrl-C is pressed during error reporting, likely because the error
-  // handler fails to abort. Let VM die immediately.
-  if (sig == SIGINT && VMError::is_error_reported()) {
-    os::die();
-  }
-
-  os::signal_notify(sig);
-}
-
-void* os::user_handler() {
-  return CAST_FROM_FN_PTR(void*, UserHandler);
-}
-
-extern "C" {
-  typedef void (*sa_handler_t)(int);
-  typedef void (*sa_sigaction_t)(int, siginfo_t *, void *);
-}
-
-void* os::signal(int signal_number, void* handler) {
-  struct sigaction sigAct, oldSigAct;
-
-  sigfillset(&(sigAct.sa_mask));
-
-  // Do not block out synchronous signals in the signal handler.
-  // Blocking synchronous signals only makes sense if you can really
-  // be sure that those signals won't happen during signal handling,
-  // when the blocking applies. Normal signal handlers are lean and
-  // do not cause signals. But our signal handlers tend to be "risky"
-  // - secondary SIGSEGV, SIGILL, SIGBUS' may and do happen.
-  // On AIX, PASE there was a case where a SIGSEGV happened, followed
-  // by a SIGILL, which was blocked due to the signal mask. The process
-  // just hung forever. Better to crash from a secondary signal than to hang.
-  sigdelset(&(sigAct.sa_mask), SIGSEGV);
-  sigdelset(&(sigAct.sa_mask), SIGBUS);
-  sigdelset(&(sigAct.sa_mask), SIGILL);
-  sigdelset(&(sigAct.sa_mask), SIGFPE);
-  sigdelset(&(sigAct.sa_mask), SIGTRAP);
-
-  sigAct.sa_flags   = SA_RESTART|SA_SIGINFO;
-
-  sigAct.sa_handler = CAST_TO_FN_PTR(sa_handler_t, handler);
-
-  if (sigaction(signal_number, &sigAct, &oldSigAct)) {
-    // -1 means registration failed
-    return (void *)-1;
-  }
-
-  return CAST_FROM_FN_PTR(void*, oldSigAct.sa_handler);
-}
-
-void os::signal_raise(int signal_number) {
-  ::raise(signal_number);
-}
-
-//
-// The following code is moved from os.cpp for making this
-// code platform specific, which it is by its very nature.
-//
-
-// Will be modified when max signal is changed to be dynamic
-int os::sigexitnum_pd() {
-  return NSIG;
-}
-
-// a counter for each possible signal value
-static volatile jint pending_signals[NSIG+1] = { 0 };
-
-// Wrapper functions for: sem_init(), sem_post(), sem_wait()
-// On AIX, we use sem_init(), sem_post(), sem_wait()
-// On Pase, we need to use msem_lock() and msem_unlock(), because Posix Semaphores
-// do not seem to work at all on PASE (unimplemented, will cause SIGILL).
-// Note that just using msem_.. APIs for both PASE and AIX is not an option either, as
-// on AIX, msem_..() calls are suspected of causing problems.
-static sem_t sig_sem;
-static msemaphore* p_sig_msem = 0;
-
-static void local_sem_init() {
-  if (os::Aix::on_aix()) {
-    int rc = ::sem_init(&sig_sem, 0, 0);
-    guarantee(rc != -1, "sem_init failed");
-  } else {
-    // Memory semaphores must live in shared mem.
-    guarantee0(p_sig_msem == NULL);
-    p_sig_msem = (msemaphore*)os::reserve_memory(sizeof(msemaphore), NULL);
-    guarantee(p_sig_msem, "Cannot allocate memory for memory semaphore");
-    guarantee(::msem_init(p_sig_msem, 0) == p_sig_msem, "msem_init failed");
-  }
-}
-
-static void local_sem_post() {
-  static bool warn_only_once = false;
-  if (os::Aix::on_aix()) {
-    int rc = ::sem_post(&sig_sem);
-    if (rc == -1 && !warn_only_once) {
-      trcVerbose("sem_post failed (errno = %d, %s)", errno, os::errno_name(errno));
-      warn_only_once = true;
-    }
-  } else {
-    guarantee0(p_sig_msem != NULL);
-    int rc = ::msem_unlock(p_sig_msem, 0);
-    if (rc == -1 && !warn_only_once) {
-      trcVerbose("msem_unlock failed (errno = %d, %s)", errno, os::errno_name(errno));
-      warn_only_once = true;
-    }
-  }
-}
-
-static void local_sem_wait() {
-  static bool warn_only_once = false;
-  if (os::Aix::on_aix()) {
-    int rc = ::sem_wait(&sig_sem);
-    if (rc == -1 && !warn_only_once) {
-      trcVerbose("sem_wait failed (errno = %d, %s)", errno, os::errno_name(errno));
-      warn_only_once = true;
-    }
-  } else {
-    guarantee0(p_sig_msem != NULL); // must init before use
-    int rc = ::msem_lock(p_sig_msem, 0);
-    if (rc == -1 && !warn_only_once) {
-      trcVerbose("msem_lock failed (errno = %d, %s)", errno, os::errno_name(errno));
-      warn_only_once = true;
-    }
-  }
-}
-
-static void jdk_misc_signal_init() {
-  // Initialize signal structures
-  ::memset((void*)pending_signals, 0, sizeof(pending_signals));
-
-  // Initialize signal semaphore
-  local_sem_init();
-}
-
-void os::signal_notify(int sig) {
-  Atomic::inc(&pending_signals[sig]);
-  local_sem_post();
-}
-
-static int check_pending_signals() {
-  for (;;) {
-    for (int i = 0; i < NSIG + 1; i++) {
-      jint n = pending_signals[i];
-      if (n > 0 && n == Atomic::cmpxchg(n - 1, &pending_signals[i], n)) {
-        return i;
-      }
-    }
-    JavaThread *thread = JavaThread::current();
-    ThreadBlockInVM tbivm(thread);
-
-    bool threadIsSuspended;
-    do {
-      thread->set_suspend_equivalent();
-      // cleared by handle_special_suspend_equivalent_condition() or java_suspend_self()
-
-      local_sem_wait();
-
-      // were we externally suspended while we were waiting?
-      threadIsSuspended = thread->handle_special_suspend_equivalent_condition();
-      if (threadIsSuspended) {
-        //
-        // The semaphore has been incremented, but while we were waiting
-        // another thread suspended us. We don't want to continue running
-        // while suspended because that would surprise the thread that
-        // suspended us.
-        //
-
-        local_sem_post();
-
-        thread->java_suspend_self();
-      }
-    } while (threadIsSuspended);
-  }
-}
-
-int os::signal_wait() {
-  return check_pending_signals();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1903,7 +1505,7 @@ static vmembk_t* vmembk_find(char* addr) {
       return p;
     }
   }
-  return NULL;
+  return nullptr;
 }
 
 static void vmembk_remove(vmembk_t* p0) {
@@ -1929,32 +1531,21 @@ static void vmembk_print_on(outputStream* os) {
 }
 
 // Reserve and attach a section of System V memory.
-// If <requested_addr> is not NULL, function will attempt to attach the memory at the given
+// If <requested_addr> is not null, function will attempt to attach the memory at the given
 // address. Failing that, it will attach the memory anywhere.
-// If <requested_addr> is NULL, function will attach the memory anywhere.
-//
-// <alignment_hint> is being ignored by this function. It is very probable however that the
-// alignment requirements are met anyway, because shmat() attaches at 256M boundaries.
-// Should this be not enogh, we can put more work into it.
-static char* reserve_shmated_memory (
-  size_t bytes,
-  char* requested_addr,
-  size_t alignment_hint) {
+// If <requested_addr> is null, function will attach the memory anywhere.
+static char* reserve_shmated_memory (size_t bytes, char* requested_addr) {
 
   trcVerbose("reserve_shmated_memory " UINTX_FORMAT " bytes, wishaddress "
-    PTR_FORMAT ", alignment_hint " UINTX_FORMAT "...",
-    bytes, p2i(requested_addr), alignment_hint);
-
-  // Either give me wish address or wish alignment but not both.
-  assert0(!(requested_addr != NULL && alignment_hint != 0));
+    PTR_FORMAT "...", bytes, p2i(requested_addr));
 
   // We must prevent anyone from attaching too close to the
   // BRK because that may cause malloc OOM.
-  if (requested_addr != NULL && is_close_to_brk((address)requested_addr)) {
-    trcVerbose("Wish address " PTR_FORMAT " is too close to the BRK segment. "
-      "Will attach anywhere.", p2i(requested_addr));
-    // Act like the OS refused to attach there.
-    requested_addr = NULL;
+  if (requested_addr != nullptr && is_close_to_brk((address)requested_addr)) {
+    trcVerbose("Wish address " PTR_FORMAT " is too close to the BRK segment.", p2i(requested_addr));
+    // Since we treat an attach to the wrong address as an error later anyway,
+    // we return null here
+    return nullptr;
   }
 
   // For old AS/400's (V5R4 and older) we should not even be here - System V shared memory is not
@@ -1970,7 +1561,7 @@ static char* reserve_shmated_memory (
   int shmid = shmget(IPC_PRIVATE, size, IPC_CREAT | S_IRUSR | S_IWUSR);
   if (shmid == -1) {
     trcVerbose("shmget(.., " UINTX_FORMAT ", ..) failed (errno: %d).", size, errno);
-    return NULL;
+    return nullptr;
   }
 
   // Important note:
@@ -1990,14 +1581,17 @@ static char* reserve_shmated_memory (
   }
 
   // Now attach the shared segment.
-  // Note that I attach with SHM_RND - which means that the requested address is rounded down, if
-  // needed, to the next lowest segment boundary. Otherwise the attach would fail if the address
-  // were not a segment boundary.
-  char* const addr = (char*) shmat(shmid, requested_addr, SHM_RND);
+  // Note that we deliberately *don't* pass SHM_RND. The contract of os::attempt_reserve_memory_at() -
+  // which invokes this function with a request address != NULL - is to map at the specified address
+  // excactly, or to fail. If the caller passed us an address that is not usable (aka not a valid segment
+  // boundary), shmat should not round down the address, or think up a completely new one.
+  // (In places where this matters, e.g. when reserving the heap, we take care of passing segment-aligned
+  // addresses on Aix. See, e.g., ReservedHeapSpace.
+  char* const addr = (char*) shmat(shmid, requested_addr, 0);
   const int errno_shmat = errno;
 
   // (A) Right after shmat and before handing shmat errors delete the shm segment.
-  if (::shmctl(shmid, IPC_RMID, NULL) == -1) {
+  if (::shmctl(shmid, IPC_RMID, nullptr) == -1) {
     trcVerbose("shmctl(%u, IPC_RMID) failed (%d)\n", shmid, errno);
     assert(false, "failed to remove shared memory segment!");
   }
@@ -2005,13 +1599,13 @@ static char* reserve_shmated_memory (
   // Handle shmat error. If we failed to attach, just return.
   if (addr == (char*)-1) {
     trcVerbose("Failed to attach segment at " PTR_FORMAT " (%d).", p2i(requested_addr), errno_shmat);
-    return NULL;
+    return nullptr;
   }
 
   // Just for info: query the real page size. In case setting the page size did not
   // work (see above), the system may have given us something other then 4K (LDR_CNTRL).
   const size_t real_pagesize = os::Aix::query_pagesize(addr);
-  if (real_pagesize != shmbuf.shm_pagesize) {
+  if (real_pagesize != (size_t)shmbuf.shm_pagesize) {
     trcVerbose("pagesize is, surprisingly, " SIZE_FORMAT, real_pagesize);
   }
 
@@ -2019,7 +1613,7 @@ static char* reserve_shmated_memory (
     trcVerbose("shm-allocated " PTR_FORMAT " .. " PTR_FORMAT " (" UINTX_FORMAT " bytes, " UINTX_FORMAT " %s pages)",
       p2i(addr), p2i(addr + size - 1), size, size/real_pagesize, describe_pagesize(real_pagesize));
   } else {
-    if (requested_addr != NULL) {
+    if (requested_addr != nullptr) {
       trcVerbose("failed to shm-allocate " UINTX_FORMAT " bytes at with address " PTR_FORMAT ".", size, p2i(requested_addr));
     } else {
       trcVerbose("failed to shm-allocate " UINTX_FORMAT " bytes at any address.", size);
@@ -2068,49 +1662,39 @@ static bool uncommit_shmated_memory(char* addr, size_t size) {
 // Reserve memory via mmap.
 // If <requested_addr> is given, an attempt is made to attach at the given address.
 // Failing that, memory is allocated at any address.
-// If <alignment_hint> is given and <requested_addr> is NULL, an attempt is made to
-// allocate at an address aligned with the given alignment. Failing that, memory
-// is aligned anywhere.
-static char* reserve_mmaped_memory(size_t bytes, char* requested_addr, size_t alignment_hint) {
-  trcVerbose("reserve_mmaped_memory " UINTX_FORMAT " bytes, wishaddress " PTR_FORMAT ", "
-    "alignment_hint " UINTX_FORMAT "...",
-    bytes, p2i(requested_addr), alignment_hint);
+static char* reserve_mmaped_memory(size_t bytes, char* requested_addr) {
+  trcVerbose("reserve_mmaped_memory " UINTX_FORMAT " bytes, wishaddress " PTR_FORMAT "...",
+    bytes, p2i(requested_addr));
 
-  // If a wish address is given, but not aligned to 4K page boundary, mmap will fail.
   if (requested_addr && !is_aligned_to(requested_addr, os::vm_page_size()) != 0) {
     trcVerbose("Wish address " PTR_FORMAT " not aligned to page boundary.", p2i(requested_addr));
-    return NULL;
+    return nullptr;
   }
 
   // We must prevent anyone from attaching too close to the
   // BRK because that may cause malloc OOM.
-  if (requested_addr != NULL && is_close_to_brk((address)requested_addr)) {
-    trcVerbose("Wish address " PTR_FORMAT " is too close to the BRK segment. "
-      "Will attach anywhere.", p2i(requested_addr));
-    // Act like the OS refused to attach there.
-    requested_addr = NULL;
+  if (requested_addr != nullptr && is_close_to_brk((address)requested_addr)) {
+    trcVerbose("Wish address " PTR_FORMAT " is too close to the BRK segment.", p2i(requested_addr));
+    // Since we treat an attach to the wrong address as an error later anyway,
+    // we return null here
+    return nullptr;
   }
 
-  // Specify one or the other but not both.
-  assert0(!(requested_addr != NULL && alignment_hint > 0));
-
-  // In 64K mode, we claim the global page size (os::vm_page_size())
-  // is 64K. This is one of the few points where that illusion may
-  // break, because mmap() will always return memory aligned to 4K. So
-  // we must ensure we only ever return memory aligned to 64k.
-  if (alignment_hint) {
-    alignment_hint = lcm(alignment_hint, os::vm_page_size());
-  } else {
-    alignment_hint = os::vm_page_size();
-  }
+  // In 64K mode, we lie and claim the global page size (os::vm_page_size()) is 64K
+  //  (complicated story). This mostly works just fine since 64K is a multiple of the
+  //  actual 4K lowest page size. Only at a few seams light shines thru, e.g. when
+  //  calling mmap. mmap will return memory aligned to the lowest pages size - 4K -
+  //  so we must make sure - transparently - that the caller only ever sees 64K
+  //  aligned mapping start addresses.
+  const size_t alignment = os::vm_page_size();
 
   // Size shall always be a multiple of os::vm_page_size (esp. in 64K mode).
   const size_t size = align_up(bytes, os::vm_page_size());
 
   // alignment: Allocate memory large enough to include an aligned range of the right size and
   // cut off the leading and trailing waste pages.
-  assert0(alignment_hint != 0 && is_aligned_to(alignment_hint, os::vm_page_size())); // see above
-  const size_t extra_size = size + alignment_hint;
+  assert0(alignment != 0 && is_aligned_to(alignment, os::vm_page_size())); // see above
+  const size_t extra_size = size + alignment;
 
   // Note: MAP_SHARED (instead of MAP_PRIVATE) needed to be able to
   // later use msync(MS_INVALIDATE) (see os::uncommit_memory).
@@ -2123,7 +1707,7 @@ static char* reserve_mmaped_memory(size_t bytes, char* requested_addr, size_t al
   // SPEC1170 mode active: behaviour like POSIX, MAP_FIXED will clobber existing mappings.
   // SPEC1170 mode not active: behaviour, unlike POSIX, is that no existing mappings will
   // get clobbered.
-  if (requested_addr != NULL) {
+  if (requested_addr != nullptr) {
     if (!os::Aix::xpg_sus_mode()) {  // not SPEC1170 Behaviour
       flags |= MAP_FIXED;
     }
@@ -2134,11 +1718,16 @@ static char* reserve_mmaped_memory(size_t bytes, char* requested_addr, size_t al
 
   if (addr == MAP_FAILED) {
     trcVerbose("mmap(" PTR_FORMAT ", " UINTX_FORMAT ", ..) failed (%d)", p2i(requested_addr), size, errno);
-    return NULL;
+    return nullptr;
+  } else if (requested_addr != nullptr && addr != requested_addr) {
+    trcVerbose("mmap(" PTR_FORMAT ", " UINTX_FORMAT ", ..) succeeded, but at a different address than requested (" PTR_FORMAT "), will unmap",
+               p2i(requested_addr), size, p2i(addr));
+    ::munmap(addr, extra_size);
+    return nullptr;
   }
 
   // Handle alignment.
-  char* const addr_aligned = align_up(addr, alignment_hint);
+  char* const addr_aligned = align_up(addr, alignment);
   const size_t waste_pre = addr_aligned - addr;
   char* const addr_aligned_end = addr_aligned + size;
   const size_t waste_post = extra_size - waste_pre - size;
@@ -2150,16 +1739,8 @@ static char* reserve_mmaped_memory(size_t bytes, char* requested_addr, size_t al
   }
   addr = addr_aligned;
 
-  if (addr) {
-    trcVerbose("mmap-allocated " PTR_FORMAT " .. " PTR_FORMAT " (" UINTX_FORMAT " bytes)",
-      p2i(addr), p2i(addr + bytes), bytes);
-  } else {
-    if (requested_addr != NULL) {
-      trcVerbose("failed to mmap-allocate " UINTX_FORMAT " bytes at wish address " PTR_FORMAT ".", bytes, p2i(requested_addr));
-    } else {
-      trcVerbose("failed to mmap-allocate " UINTX_FORMAT " bytes at any address.", bytes);
-    }
-  }
+  trcVerbose("mmap-allocated " PTR_FORMAT " .. " PTR_FORMAT " (" UINTX_FORMAT " bytes)",
+    p2i(addr), p2i(addr + bytes), bytes);
 
   // bookkeeping
   vmembk_add(addr, size, 4*K, VMEM_MAPPED);
@@ -2210,18 +1791,6 @@ static bool uncommit_mmaped_memory(char* addr, size_t size) {
   return rc;
 }
 
-int os::vm_page_size() {
-  // Seems redundant as all get out.
-  assert(os::Aix::page_size() != -1, "must call os::init");
-  return os::Aix::page_size();
-}
-
-// Aix allocates memory by pages.
-int os::vm_allocation_granularity() {
-  assert(os::Aix::page_size() != -1, "must call os::init");
-  return os::Aix::page_size();
-}
-
 #ifdef PRODUCT
 static void warn_fail_commit_memory(char* addr, size_t size, bool exec,
                                     int err) {
@@ -2233,7 +1802,7 @@ static void warn_fail_commit_memory(char* addr, size_t size, bool exec,
 
 void os::pd_commit_memory_or_exit(char* addr, size_t size, bool exec,
                                   const char* mesg) {
-  assert(mesg != NULL, "mesg must be specified");
+  assert(mesg != nullptr, "mesg must be specified");
   if (!pd_commit_memory(addr, size, exec)) {
     // Add extra info in product mode for vm_exit_out_of_memory():
     PRODUCT_ONLY(warn_fail_commit_memory(addr, size, exec, errno);)
@@ -2244,10 +1813,10 @@ void os::pd_commit_memory_or_exit(char* addr, size_t size, bool exec,
 bool os::pd_commit_memory(char* addr, size_t size, bool exec) {
 
   assert(is_aligned_to(addr, os::vm_page_size()),
-    "addr " PTR_FORMAT " not aligned to vm_page_size (" PTR_FORMAT ")",
+    "addr " PTR_FORMAT " not aligned to vm_page_size (" SIZE_FORMAT ")",
     p2i(addr), os::vm_page_size());
   assert(is_aligned_to(size, os::vm_page_size()),
-    "size " PTR_FORMAT " not aligned to vm_page_size (" PTR_FORMAT ")",
+    "size " PTR_FORMAT " not aligned to vm_page_size (" SIZE_FORMAT ")",
     size, os::vm_page_size());
 
   vmembk_t* const vmi = vmembk_find(addr);
@@ -2277,12 +1846,12 @@ void os::pd_commit_memory_or_exit(char* addr, size_t size,
   pd_commit_memory_or_exit(addr, size, exec, mesg);
 }
 
-bool os::pd_uncommit_memory(char* addr, size_t size) {
+bool os::pd_uncommit_memory(char* addr, size_t size, bool exec) {
   assert(is_aligned_to(addr, os::vm_page_size()),
-    "addr " PTR_FORMAT " not aligned to vm_page_size (" PTR_FORMAT ")",
+    "addr " PTR_FORMAT " not aligned to vm_page_size (" SIZE_FORMAT ")",
     p2i(addr), os::vm_page_size());
   assert(is_aligned_to(size, os::vm_page_size()),
-    "size " PTR_FORMAT " not aligned to vm_page_size (" PTR_FORMAT ")",
+    "size " PTR_FORMAT " not aligned to vm_page_size (" SIZE_FORMAT ")",
     size, os::vm_page_size());
 
   // Dynamically do different things for mmap/shmat.
@@ -2333,7 +1902,7 @@ int os::numa_get_group_id() {
   return 0;
 }
 
-size_t os::numa_get_leaf_groups(int *ids, size_t size) {
+size_t os::numa_get_leaf_groups(uint *ids, size_t size) {
   if (size > 0) {
     ids[0] = 0;
     return 1;
@@ -2341,42 +1910,28 @@ size_t os::numa_get_leaf_groups(int *ids, size_t size) {
   return 0;
 }
 
-bool os::get_page_info(char *start, page_info* info) {
+int os::numa_get_group_id_for_address(const void* address) {
+  return 0;
+}
+
+bool os::numa_get_group_ids_for_range(const void** addresses, int* lgrp_ids, size_t count) {
   return false;
 }
 
-char *os::scan_pages(char *start, char* end, page_info* page_expected, page_info* page_found) {
-  return end;
-}
-
 // Reserves and attaches a shared memory segment.
-// Will assert if a wish address is given and could not be obtained.
-char* os::pd_reserve_memory(size_t bytes, char* requested_addr, size_t alignment_hint) {
-
-  // All other Unices do a mmap(MAP_FIXED) if the addr is given,
-  // thereby clobbering old mappings at that place. That is probably
-  // not intended, never used and almost certainly an error were it
-  // ever be used this way (to try attaching at a specified address
-  // without clobbering old mappings an alternate API exists,
-  // os::attempt_reserve_memory_at()).
-  // Instead of mimicking the dangerous coding of the other platforms, here I
-  // just ignore the request address (release) or assert(debug).
-  assert0(requested_addr == NULL);
-
+char* os::pd_reserve_memory(size_t bytes, bool exec) {
   // Always round to os::vm_page_size(), which may be larger than 4K.
   bytes = align_up(bytes, os::vm_page_size());
-  const size_t alignment_hint0 =
-    alignment_hint ? align_up(alignment_hint, os::vm_page_size()) : 0;
 
   // In 4K mode always use mmap.
   // In 64K mode allocate small sizes with mmap, large ones with 64K shmatted.
   if (os::vm_page_size() == 4*K) {
-    return reserve_mmaped_memory(bytes, requested_addr, alignment_hint);
+    return reserve_mmaped_memory(bytes, nullptr /* requested_addr */);
   } else {
     if (bytes >= Use64KPagesThreshold) {
-      return reserve_shmated_memory(bytes, requested_addr, alignment_hint);
+      return reserve_shmated_memory(bytes, nullptr /* requested_addr */);
     } else {
-      return reserve_mmaped_memory(bytes, requested_addr, alignment_hint);
+      return reserve_mmaped_memory(bytes, nullptr /* requested_addr */);
     }
   }
 }
@@ -2386,6 +1941,7 @@ bool os::pd_release_memory(char* addr, size_t size) {
   // Dynamically do different things for mmap/shmat.
   vmembk_t* const vmi = vmembk_find(addr);
   guarantee0(vmi);
+  vmi->assert_is_valid_subrange(addr, size);
 
   // Always round to os::vm_page_size(), which may be larger than 4K.
   size = align_up(size, os::vm_page_size());
@@ -2399,7 +1955,6 @@ bool os::pd_release_memory(char* addr, size_t size) {
     // - If user only wants to release a partial range, uncommit (disclaim) that
     //   range. That way, at least, we do not use memory anymore (bust still page
     //   table space).
-    vmi->assert_is_valid_subrange(addr, size);
     if (addr == vmi->addr && size == vmi->size) {
       rc = release_shmated_memory(addr, size);
       remove_bookkeeping = true;
@@ -2407,12 +1962,30 @@ bool os::pd_release_memory(char* addr, size_t size) {
       rc = uncommit_shmated_memory(addr, size);
     }
   } else {
-    // User may unmap partial regions but region has to be fully contained.
-#ifdef ASSERT
-    vmi->assert_is_valid_subrange(addr, size);
-#endif
+    // In mmap-mode:
+    //  - If the user wants to release the full range, we do that and remove the mapping.
+    //  - If the user wants to release part of the range, we release that part, but need
+    //    to adjust bookkeeping.
+    assert(is_aligned(size, 4 * K), "Sanity");
     rc = release_mmaped_memory(addr, size);
-    remove_bookkeeping = true;
+    if (addr == vmi->addr && size == vmi->size) {
+      remove_bookkeeping = true;
+    } else {
+      if (addr == vmi->addr && size < vmi->size) {
+        // Chopped from head
+        vmi->addr += size;
+        vmi->size -= size;
+      } else if (addr + size == vmi->addr + vmi->size) {
+        // Chopped from tail
+        vmi->size -= size;
+      } else {
+        // releasing a mapping in the middle of the original mapping:
+        // For now we forbid this, since this is an invalid scenario
+        // (the bookkeeping is easy enough to fix if needed but there
+        //  is no use case for it; any occurrence is likely an error.
+        ShouldNotReachHere();
+      }
+    }
   }
 
   // update bookkeeping
@@ -2428,12 +2001,12 @@ static bool checked_mprotect(char* addr, size_t size, int prot) {
   // Little problem here: if SPEC1170 behaviour is off, mprotect() on AIX will
   // not tell me if protection failed when trying to protect an un-protectable range.
   //
-  // This means if the memory was allocated using shmget/shmat, protection wont work
+  // This means if the memory was allocated using shmget/shmat, protection won't work
   // but mprotect will still return 0:
   //
   // See http://publib.boulder.ibm.com/infocenter/pseries/v5r3/index.jsp?topic=/com.ibm.aix.basetechref/doc/basetrf1/mprotect.htm
 
-  Events::log(NULL, "Protecting memory [" INTPTR_FORMAT "," INTPTR_FORMAT "] with protection modes %x", p2i(addr), p2i(addr+size), prot);
+  Events::log(nullptr, "Protecting memory [" INTPTR_FORMAT "," INTPTR_FORMAT "] with protection modes %x", p2i(addr), p2i(addr+size), prot);
   bool rc = ::mprotect(addr, size, prot) == 0 ? true : false;
 
   if (!rc) {
@@ -2451,36 +2024,33 @@ static bool checked_mprotect(char* addr, size_t size, int prot) {
   //
   if (!os::Aix::xpg_sus_mode()) {
 
-    if (CanUseSafeFetch32()) {
+    const bool read_protected =
+      (SafeFetch32((int*)addr, 0x12345678) == 0x12345678 &&
+       SafeFetch32((int*)addr, 0x76543210) == 0x76543210) ? true : false;
 
-      const bool read_protected =
-        (SafeFetch32((int*)addr, 0x12345678) == 0x12345678 &&
-         SafeFetch32((int*)addr, 0x76543210) == 0x76543210) ? true : false;
+    if (prot & PROT_READ) {
+      rc = !read_protected;
+    } else {
+      rc = read_protected;
+    }
 
-      if (prot & PROT_READ) {
-        rc = !read_protected;
-      } else {
-        rc = read_protected;
-      }
+    if (!rc) {
+      if (os::Aix::on_pase()) {
+        // There is an issue on older PASE systems where mprotect() will return success but the
+        // memory will not be protected.
+        // This has nothing to do with the problem of using mproect() on SPEC1170 incompatible
+        // machines; we only see it rarely, when using mprotect() to protect the guard page of
+        // a stack. It is an OS error.
+        //
+        // A valid strategy is just to try again. This usually works. :-/
 
-      if (!rc) {
-        if (os::Aix::on_pase()) {
-          // There is an issue on older PASE systems where mprotect() will return success but the
-          // memory will not be protected.
-          // This has nothing to do with the problem of using mproect() on SPEC1170 incompatible
-          // machines; we only see it rarely, when using mprotect() to protect the guard page of
-          // a stack. It is an OS error.
-          //
-          // A valid strategy is just to try again. This usually works. :-/
-
-          ::usleep(1000);
-          Events::log(NULL, "Protecting memory [" INTPTR_FORMAT "," INTPTR_FORMAT "] with protection modes %x", p2i(addr), p2i(addr+size), prot);
-          if (::mprotect(addr, size, prot) == 0) {
-            const bool read_protected_2 =
-              (SafeFetch32((int*)addr, 0x12345678) == 0x12345678 &&
-              SafeFetch32((int*)addr, 0x76543210) == 0x76543210) ? true : false;
-            rc = true;
-          }
+        ::usleep(1000);
+        Events::log(nullptr, "Protecting memory [" INTPTR_FORMAT "," INTPTR_FORMAT "] with protection modes %x", p2i(addr), p2i(addr+size), prot);
+        if (::mprotect(addr, size, prot) == 0) {
+          const bool read_protected_2 =
+            (SafeFetch32((int*)addr, 0x12345678) == 0x12345678 &&
+            SafeFetch32((int*)addr, 0x76543210) == 0x76543210) ? true : false;
+          rc = true;
         }
       }
     }
@@ -2523,17 +2093,13 @@ void os::large_page_init() {
   return; // Nothing to do. See query_multipage_support and friends.
 }
 
-char* os::reserve_memory_special(size_t bytes, size_t alignment, char* req_addr, bool exec) {
-  // reserve_memory_special() is used to allocate large paged memory. On AIX, we implement
-  // 64k paged memory reservation using the normal memory allocation paths (os::reserve_memory()),
-  // so this is not needed.
-  assert(false, "should not be called on AIX");
-  return NULL;
+char* os::pd_reserve_memory_special(size_t bytes, size_t alignment, size_t page_size, char* req_addr, bool exec) {
+  fatal("os::reserve_memory_special should not be called on AIX.");
+  return nullptr;
 }
 
-bool os::release_memory_special(char* base, size_t bytes) {
-  // Detaching the SHM segment will also delete it, see reserve_memory_special().
-  Unimplemented();
+bool os::pd_release_memory_special(char* base, size_t bytes) {
+  fatal("os::release_memory_special should not be called on AIX.");
   return false;
 }
 
@@ -2551,16 +2117,16 @@ bool os::can_execute_large_page_memory() {
   return false;
 }
 
-char* os::pd_attempt_reserve_memory_at(size_t bytes, char* requested_addr, int file_desc) {
+char* os::pd_attempt_map_memory_to_file_at(char* requested_addr, size_t bytes, int file_desc) {
   assert(file_desc >= 0, "file_desc is not valid");
-  char* result = NULL;
+  char* result = nullptr;
 
   // Always round to os::vm_page_size(), which may be larger than 4K.
   bytes = align_up(bytes, os::vm_page_size());
-  result = reserve_mmaped_memory(bytes, requested_addr, 0);
+  result = reserve_mmaped_memory(bytes, requested_addr);
 
-  if (result != NULL) {
-    if (replace_existing_mapping_with_file_mapping(result, bytes, file_desc) == NULL) {
+  if (result != nullptr) {
+    if (replace_existing_mapping_with_file_mapping(result, bytes, file_desc) == nullptr) {
       vm_exit_during_initialization(err_msg("Error in mapping Java heap at the given filesystem directory"));
     }
   }
@@ -2569,8 +2135,8 @@ char* os::pd_attempt_reserve_memory_at(size_t bytes, char* requested_addr, int f
 
 // Reserve memory at an arbitrary address, only if that area is
 // available (and not reserved for something else).
-char* os::pd_attempt_reserve_memory_at(size_t bytes, char* requested_addr) {
-  char* addr = NULL;
+char* os::pd_attempt_reserve_memory_at(char* requested_addr, size_t bytes, bool exec) {
+  char* addr = nullptr;
 
   // Always round to os::vm_page_size(), which may be larger than 4K.
   bytes = align_up(bytes, os::vm_page_size());
@@ -2578,23 +2144,25 @@ char* os::pd_attempt_reserve_memory_at(size_t bytes, char* requested_addr) {
   // In 4K mode always use mmap.
   // In 64K mode allocate small sizes with mmap, large ones with 64K shmatted.
   if (os::vm_page_size() == 4*K) {
-    return reserve_mmaped_memory(bytes, requested_addr, 0);
+    return reserve_mmaped_memory(bytes, requested_addr);
   } else {
     if (bytes >= Use64KPagesThreshold) {
-      return reserve_shmated_memory(bytes, requested_addr, 0);
+      return reserve_shmated_memory(bytes, requested_addr);
     } else {
-      return reserve_mmaped_memory(bytes, requested_addr, 0);
+      return reserve_mmaped_memory(bytes, requested_addr);
     }
   }
 
   return addr;
 }
 
-// Sleep forever; naked call to OS-specific sleep; use with CAUTION
-void os::infinite_sleep() {
-  while (true) {    // sleep forever ...
-    ::sleep(100);   // ... 100 seconds at a time
-  }
+size_t os::vm_min_address() {
+  // On AIX, we need to make sure we don't block the sbrk. However, this is
+  // done at actual reservation time, where we honor a "no-mmap" area following
+  // the break. See MaxExpectedDataSegmentSize. So we can return a very low
+  // address here.
+  assert(is_aligned(_vm_min_address_default, os::vm_allocation_granularity()), "Sanity");
+  return _vm_min_address_default;
 }
 
 // Used to convert frequent JVM_Yield() to nops
@@ -2644,7 +2212,7 @@ int os::java_to_os_priority[CriticalPriority + 1] = {
 static int prio_init() {
   if (ThreadPriorityPolicy == 1) {
     if (geteuid() != 0) {
-      if (!FLAG_IS_DEFAULT(ThreadPriorityPolicy)) {
+      if (!FLAG_IS_DEFAULT(ThreadPriorityPolicy) && !FLAG_IS_JIMAGE_RESOURCE(ThreadPriorityPolicy)) {
         warning("-XX:ThreadPriorityPolicy=1 may require system level permission, " \
                 "e.g., being the root user. If the necessary permission is not " \
                 "possessed, changes to priority will be silently ignored.");
@@ -2686,709 +2254,16 @@ OSReturn os::get_native_priority(const Thread* const thread, int *priority_ptr) 
   return (ret == 0) ? OS_OK : OS_ERR;
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// suspend/resume support
-
-//  The low-level signal-based suspend/resume support is a remnant from the
-//  old VM-suspension that used to be for java-suspension, safepoints etc,
-//  within hotspot. Currently used by JFR's OSThreadSampler
-//
-//  The remaining code is greatly simplified from the more general suspension
-//  code that used to be used.
-//
-//  The protocol is quite simple:
-//  - suspend:
-//      - sends a signal to the target thread
-//      - polls the suspend state of the osthread using a yield loop
-//      - target thread signal handler (SR_handler) sets suspend state
-//        and blocks in sigsuspend until continued
-//  - resume:
-//      - sets target osthread state to continue
-//      - sends signal to end the sigsuspend loop in the SR_handler
-//
-//  Note that the SR_lock plays no role in this suspend/resume protocol,
-//  but is checked for NULL in SR_handler as a thread termination indicator.
-//  The SR_lock is, however, used by JavaThread::java_suspend()/java_resume() APIs.
-//
-//  Note that resume_clear_context() and suspend_save_context() are needed
-//  by SR_handler(), so that fetch_frame_from_ucontext() works,
-//  which in part is used by:
-//    - Forte Analyzer: AsyncGetCallTrace()
-//    - StackBanging: get_frame_at_stack_banging_point()
-
-static void resume_clear_context(OSThread *osthread) {
-  osthread->set_ucontext(NULL);
-  osthread->set_siginfo(NULL);
-}
-
-static void suspend_save_context(OSThread *osthread, siginfo_t* siginfo, ucontext_t* context) {
-  osthread->set_ucontext(context);
-  osthread->set_siginfo(siginfo);
-}
-
-//
-// Handler function invoked when a thread's execution is suspended or
-// resumed. We have to be careful that only async-safe functions are
-// called here (Note: most pthread functions are not async safe and
-// should be avoided.)
-//
-// Note: sigwait() is a more natural fit than sigsuspend() from an
-// interface point of view, but sigwait() prevents the signal hander
-// from being run. libpthread would get very confused by not having
-// its signal handlers run and prevents sigwait()'s use with the
-// mutex granting granting signal.
-//
-// Currently only ever called on the VMThread and JavaThreads (PC sampling).
-//
-static void SR_handler(int sig, siginfo_t* siginfo, ucontext_t* context) {
-  // Save and restore errno to avoid confusing native code with EINTR
-  // after sigsuspend.
-  int old_errno = errno;
-
-  Thread* thread = Thread::current_or_null_safe();
-  assert(thread != NULL, "Missing current thread in SR_handler");
-
-  // On some systems we have seen signal delivery get "stuck" until the signal
-  // mask is changed as part of thread termination. Check that the current thread
-  // has not already terminated (via SR_lock()) - else the following assertion
-  // will fail because the thread is no longer a JavaThread as the ~JavaThread
-  // destructor has completed.
-
-  if (thread->SR_lock() == NULL) {
-    return;
-  }
-
-  assert(thread->is_VM_thread() || thread->is_Java_thread(), "Must be VMThread or JavaThread");
-
-  OSThread* osthread = thread->osthread();
-
-  os::SuspendResume::State current = osthread->sr.state();
-  if (current == os::SuspendResume::SR_SUSPEND_REQUEST) {
-    suspend_save_context(osthread, siginfo, context);
-
-    // attempt to switch the state, we assume we had a SUSPEND_REQUEST
-    os::SuspendResume::State state = osthread->sr.suspended();
-    if (state == os::SuspendResume::SR_SUSPENDED) {
-      sigset_t suspend_set;  // signals for sigsuspend()
-      sigemptyset(&suspend_set);
-      // get current set of blocked signals and unblock resume signal
-      pthread_sigmask(SIG_BLOCK, NULL, &suspend_set);
-      sigdelset(&suspend_set, SR_signum);
-
-      // wait here until we are resumed
-      while (1) {
-        sigsuspend(&suspend_set);
-
-        os::SuspendResume::State result = osthread->sr.running();
-        if (result == os::SuspendResume::SR_RUNNING) {
-          break;
-        }
-      }
-
-    } else if (state == os::SuspendResume::SR_RUNNING) {
-      // request was cancelled, continue
-    } else {
-      ShouldNotReachHere();
-    }
-
-    resume_clear_context(osthread);
-  } else if (current == os::SuspendResume::SR_RUNNING) {
-    // request was cancelled, continue
-  } else if (current == os::SuspendResume::SR_WAKEUP_REQUEST) {
-    // ignore
-  } else {
-    ShouldNotReachHere();
-  }
-
-  errno = old_errno;
-}
-
-static int SR_initialize() {
-  struct sigaction act;
-  char *s;
-  // Get signal number to use for suspend/resume
-  if ((s = ::getenv("_JAVA_SR_SIGNUM")) != 0) {
-    int sig = ::strtol(s, 0, 10);
-    if (sig > MAX2(SIGSEGV, SIGBUS) &&  // See 4355769.
-        sig < NSIG) {                   // Must be legal signal and fit into sigflags[].
-      SR_signum = sig;
-    } else {
-      warning("You set _JAVA_SR_SIGNUM=%d. It must be in range [%d, %d]. Using %d instead.",
-              sig, MAX2(SIGSEGV, SIGBUS)+1, NSIG-1, SR_signum);
-    }
-  }
-
-  assert(SR_signum > SIGSEGV && SR_signum > SIGBUS,
-        "SR_signum must be greater than max(SIGSEGV, SIGBUS), see 4355769");
-
-  sigemptyset(&SR_sigset);
-  sigaddset(&SR_sigset, SR_signum);
-
-  // Set up signal handler for suspend/resume.
-  act.sa_flags = SA_RESTART|SA_SIGINFO;
-  act.sa_handler = (void (*)(int)) SR_handler;
-
-  // SR_signum is blocked by default.
-  pthread_sigmask(SIG_BLOCK, NULL, &act.sa_mask);
-
-  if (sigaction(SR_signum, &act, 0) == -1) {
-    return -1;
-  }
-
-  // Save signal flag
-  os::Aix::set_our_sigflags(SR_signum, act.sa_flags);
-  return 0;
-}
-
-static int SR_finalize() {
-  return 0;
-}
-
-static int sr_notify(OSThread* osthread) {
-  int status = pthread_kill(osthread->pthread_id(), SR_signum);
-  assert_status(status == 0, status, "pthread_kill");
-  return status;
-}
-
-// "Randomly" selected value for how long we want to spin
-// before bailing out on suspending a thread, also how often
-// we send a signal to a thread we want to resume
-static const int RANDOMLY_LARGE_INTEGER = 1000000;
-static const int RANDOMLY_LARGE_INTEGER2 = 100;
-
-// returns true on success and false on error - really an error is fatal
-// but this seems the normal response to library errors
-static bool do_suspend(OSThread* osthread) {
-  assert(osthread->sr.is_running(), "thread should be running");
-  // mark as suspended and send signal
-
-  if (osthread->sr.request_suspend() != os::SuspendResume::SR_SUSPEND_REQUEST) {
-    // failed to switch, state wasn't running?
-    ShouldNotReachHere();
-    return false;
-  }
-
-  if (sr_notify(osthread) != 0) {
-    // try to cancel, switch to running
-
-    os::SuspendResume::State result = osthread->sr.cancel_suspend();
-    if (result == os::SuspendResume::SR_RUNNING) {
-      // cancelled
-      return false;
-    } else if (result == os::SuspendResume::SR_SUSPENDED) {
-      // somehow managed to suspend
-      return true;
-    } else {
-      ShouldNotReachHere();
-      return false;
-    }
-  }
-
-  // managed to send the signal and switch to SUSPEND_REQUEST, now wait for SUSPENDED
-
-  for (int n = 0; !osthread->sr.is_suspended(); n++) {
-    for (int i = 0; i < RANDOMLY_LARGE_INTEGER2 && !osthread->sr.is_suspended(); i++) {
-      os::naked_yield();
-    }
-
-    // timeout, try to cancel the request
-    if (n >= RANDOMLY_LARGE_INTEGER) {
-      os::SuspendResume::State cancelled = osthread->sr.cancel_suspend();
-      if (cancelled == os::SuspendResume::SR_RUNNING) {
-        return false;
-      } else if (cancelled == os::SuspendResume::SR_SUSPENDED) {
-        return true;
-      } else {
-        ShouldNotReachHere();
-        return false;
-      }
-    }
-  }
-
-  guarantee(osthread->sr.is_suspended(), "Must be suspended");
-  return true;
-}
-
-static void do_resume(OSThread* osthread) {
-  //assert(osthread->sr.is_suspended(), "thread should be suspended");
-
-  if (osthread->sr.request_wakeup() != os::SuspendResume::SR_WAKEUP_REQUEST) {
-    // failed to switch to WAKEUP_REQUEST
-    ShouldNotReachHere();
-    return;
-  }
-
-  while (!osthread->sr.is_running()) {
-    if (sr_notify(osthread) == 0) {
-      for (int n = 0; n < RANDOMLY_LARGE_INTEGER && !osthread->sr.is_running(); n++) {
-        for (int i = 0; i < 100 && !osthread->sr.is_running(); i++) {
-          os::naked_yield();
-        }
-      }
-    } else {
-      ShouldNotReachHere();
-    }
-  }
-
-  guarantee(osthread->sr.is_running(), "Must be running!");
-}
-
-///////////////////////////////////////////////////////////////////////////////////
-// signal handling (except suspend/resume)
-
-// This routine may be used by user applications as a "hook" to catch signals.
-// The user-defined signal handler must pass unrecognized signals to this
-// routine, and if it returns true (non-zero), then the signal handler must
-// return immediately. If the flag "abort_if_unrecognized" is true, then this
-// routine will never retun false (zero), but instead will execute a VM panic
-// routine kill the process.
-//
-// If this routine returns false, it is OK to call it again. This allows
-// the user-defined signal handler to perform checks either before or after
-// the VM performs its own checks. Naturally, the user code would be making
-// a serious error if it tried to handle an exception (such as a null check
-// or breakpoint) that the VM was generating for its own correct operation.
-//
-// This routine may recognize any of the following kinds of signals:
-//   SIGBUS, SIGSEGV, SIGILL, SIGFPE, SIGQUIT, SIGPIPE, SIGXFSZ, SIGUSR1.
-// It should be consulted by handlers for any of those signals.
-//
-// The caller of this routine must pass in the three arguments supplied
-// to the function referred to in the "sa_sigaction" (not the "sa_handler")
-// field of the structure passed to sigaction(). This routine assumes that
-// the sa_flags field passed to sigaction() includes SA_SIGINFO and SA_RESTART.
-//
-// Note that the VM will print warnings if it detects conflicting signal
-// handlers, unless invoked with the option "-XX:+AllowUserSignalHandlers".
-//
-extern "C" JNIEXPORT int
-JVM_handle_aix_signal(int signo, siginfo_t* siginfo, void* ucontext, int abort_if_unrecognized);
-
-// Set thread signal mask (for some reason on AIX sigthreadmask() seems
-// to be the thing to call; documentation is not terribly clear about whether
-// pthread_sigmask also works, and if it does, whether it does the same.
-bool set_thread_signal_mask(int how, const sigset_t* set, sigset_t* oset) {
-  const int rc = ::pthread_sigmask(how, set, oset);
-  // return value semantics differ slightly for error case:
-  // pthread_sigmask returns error number, sigthreadmask -1 and sets global errno
-  // (so, pthread_sigmask is more theadsafe for error handling)
-  // But success is always 0.
-  return rc == 0 ? true : false;
-}
-
-// Function to unblock all signals which are, according
-// to POSIX, typical program error signals. If they happen while being blocked,
-// they typically will bring down the process immediately.
-bool unblock_program_error_signals() {
-  sigset_t set;
-  ::sigemptyset(&set);
-  ::sigaddset(&set, SIGILL);
-  ::sigaddset(&set, SIGBUS);
-  ::sigaddset(&set, SIGFPE);
-  ::sigaddset(&set, SIGSEGV);
-  return set_thread_signal_mask(SIG_UNBLOCK, &set, NULL);
-}
-
-// Renamed from 'signalHandler' to avoid collision with other shared libs.
-static void javaSignalHandler(int sig, siginfo_t* info, void* uc) {
-  assert(info != NULL && uc != NULL, "it must be old kernel");
-
-  // Never leave program error signals blocked;
-  // on all our platforms they would bring down the process immediately when
-  // getting raised while being blocked.
-  unblock_program_error_signals();
-
-  int orig_errno = errno;  // Preserve errno value over signal handler.
-  JVM_handle_aix_signal(sig, info, uc, true);
-  errno = orig_errno;
-}
-
-// This boolean allows users to forward their own non-matching signals
-// to JVM_handle_aix_signal, harmlessly.
-bool os::Aix::signal_handlers_are_installed = false;
-
-// For signal-chaining
-bool os::Aix::libjsig_is_loaded = false;
-typedef struct sigaction *(*get_signal_t)(int);
-get_signal_t os::Aix::get_signal_action = NULL;
-
-struct sigaction* os::Aix::get_chained_signal_action(int sig) {
-  struct sigaction *actp = NULL;
-
-  if (libjsig_is_loaded) {
-    // Retrieve the old signal handler from libjsig
-    actp = (*get_signal_action)(sig);
-  }
-  if (actp == NULL) {
-    // Retrieve the preinstalled signal handler from jvm
-    actp = os::Posix::get_preinstalled_handler(sig);
-  }
-
-  return actp;
-}
-
-static bool call_chained_handler(struct sigaction *actp, int sig,
-                                 siginfo_t *siginfo, void *context) {
-  // Call the old signal handler
-  if (actp->sa_handler == SIG_DFL) {
-    // It's more reasonable to let jvm treat it as an unexpected exception
-    // instead of taking the default action.
-    return false;
-  } else if (actp->sa_handler != SIG_IGN) {
-    if ((actp->sa_flags & SA_NODEFER) == 0) {
-      // automaticlly block the signal
-      sigaddset(&(actp->sa_mask), sig);
-    }
-
-    sa_handler_t hand = NULL;
-    sa_sigaction_t sa = NULL;
-    bool siginfo_flag_set = (actp->sa_flags & SA_SIGINFO) != 0;
-    // retrieve the chained handler
-    if (siginfo_flag_set) {
-      sa = actp->sa_sigaction;
-    } else {
-      hand = actp->sa_handler;
-    }
-
-    if ((actp->sa_flags & SA_RESETHAND) != 0) {
-      actp->sa_handler = SIG_DFL;
-    }
-
-    // try to honor the signal mask
-    sigset_t oset;
-    sigemptyset(&oset);
-    pthread_sigmask(SIG_SETMASK, &(actp->sa_mask), &oset);
-
-    // call into the chained handler
-    if (siginfo_flag_set) {
-      (*sa)(sig, siginfo, context);
-    } else {
-      (*hand)(sig);
-    }
-
-    // restore the signal mask
-    pthread_sigmask(SIG_SETMASK, &oset, NULL);
-  }
-  // Tell jvm's signal handler the signal is taken care of.
-  return true;
-}
-
-bool os::Aix::chained_handler(int sig, siginfo_t* siginfo, void* context) {
-  bool chained = false;
-  // signal-chaining
-  if (UseSignalChaining) {
-    struct sigaction *actp = get_chained_signal_action(sig);
-    if (actp != NULL) {
-      chained = call_chained_handler(actp, sig, siginfo, context);
-    }
-  }
-  return chained;
-}
-
-// for diagnostic
-int sigflags[NSIG];
-
-int os::Aix::get_our_sigflags(int sig) {
-  assert(sig > 0 && sig < NSIG, "vm signal out of expected range");
-  return sigflags[sig];
-}
-
-void os::Aix::set_our_sigflags(int sig, int flags) {
-  assert(sig > 0 && sig < NSIG, "vm signal out of expected range");
-  if (sig > 0 && sig < NSIG) {
-    sigflags[sig] = flags;
-  }
-}
-
-void os::Aix::set_signal_handler(int sig, bool set_installed) {
-  // Check for overwrite.
-  struct sigaction oldAct;
-  sigaction(sig, (struct sigaction*)NULL, &oldAct);
-
-  void* oldhand = oldAct.sa_sigaction
-    ? CAST_FROM_FN_PTR(void*, oldAct.sa_sigaction)
-    : CAST_FROM_FN_PTR(void*, oldAct.sa_handler);
-  if (oldhand != CAST_FROM_FN_PTR(void*, SIG_DFL) &&
-      oldhand != CAST_FROM_FN_PTR(void*, SIG_IGN) &&
-      oldhand != CAST_FROM_FN_PTR(void*, (sa_sigaction_t)javaSignalHandler)) {
-    if (AllowUserSignalHandlers || !set_installed) {
-      // Do not overwrite; user takes responsibility to forward to us.
-      return;
-    } else if (UseSignalChaining) {
-      // save the old handler in jvm
-      os::Posix::save_preinstalled_handler(sig, oldAct);
-      // libjsig also interposes the sigaction() call below and saves the
-      // old sigaction on it own.
-    } else {
-      fatal("Encountered unexpected pre-existing sigaction handler "
-            "%#lx for signal %d.", (long)oldhand, sig);
-    }
-  }
-
-  struct sigaction sigAct;
-  sigfillset(&(sigAct.sa_mask));
-  if (!set_installed) {
-    sigAct.sa_handler = SIG_DFL;
-    sigAct.sa_flags = SA_RESTART;
-  } else {
-    sigAct.sa_sigaction = javaSignalHandler;
-    sigAct.sa_flags = SA_SIGINFO|SA_RESTART;
-  }
-  // Save flags, which are set by ours
-  assert(sig > 0 && sig < NSIG, "vm signal out of expected range");
-  sigflags[sig] = sigAct.sa_flags;
-
-  int ret = sigaction(sig, &sigAct, &oldAct);
-  assert(ret == 0, "check");
-
-  void* oldhand2 = oldAct.sa_sigaction
-                 ? CAST_FROM_FN_PTR(void*, oldAct.sa_sigaction)
-                 : CAST_FROM_FN_PTR(void*, oldAct.sa_handler);
-  assert(oldhand2 == oldhand, "no concurrent signal handler installation");
-}
-
-// install signal handlers for signals that HotSpot needs to
-// handle in order to support Java-level exception handling.
-void os::Aix::install_signal_handlers() {
-  if (!signal_handlers_are_installed) {
-    signal_handlers_are_installed = true;
-
-    // signal-chaining
-    typedef void (*signal_setting_t)();
-    signal_setting_t begin_signal_setting = NULL;
-    signal_setting_t end_signal_setting = NULL;
-    begin_signal_setting = CAST_TO_FN_PTR(signal_setting_t,
-                             dlsym(RTLD_DEFAULT, "JVM_begin_signal_setting"));
-    if (begin_signal_setting != NULL) {
-      end_signal_setting = CAST_TO_FN_PTR(signal_setting_t,
-                             dlsym(RTLD_DEFAULT, "JVM_end_signal_setting"));
-      get_signal_action = CAST_TO_FN_PTR(get_signal_t,
-                            dlsym(RTLD_DEFAULT, "JVM_get_signal_action"));
-      libjsig_is_loaded = true;
-      assert(UseSignalChaining, "should enable signal-chaining");
-    }
-    if (libjsig_is_loaded) {
-      // Tell libjsig jvm is setting signal handlers.
-      (*begin_signal_setting)();
-    }
-
-    set_signal_handler(SIGSEGV, true);
-    set_signal_handler(SIGPIPE, true);
-    set_signal_handler(SIGBUS, true);
-    set_signal_handler(SIGILL, true);
-    set_signal_handler(SIGFPE, true);
-    set_signal_handler(SIGTRAP, true);
-    set_signal_handler(SIGXFSZ, true);
-
-    if (libjsig_is_loaded) {
-      // Tell libjsig jvm finishes setting signal handlers.
-      (*end_signal_setting)();
-    }
-
-    // We don't activate signal checker if libjsig is in place, we trust ourselves
-    // and if UserSignalHandler is installed all bets are off.
-    // Log that signal checking is off only if -verbose:jni is specified.
-    if (CheckJNICalls) {
-      if (libjsig_is_loaded) {
-        tty->print_cr("Info: libjsig is activated, all active signal checking is disabled");
-        check_signals = false;
-      }
-      if (AllowUserSignalHandlers) {
-        tty->print_cr("Info: AllowUserSignalHandlers is activated, all active signal checking is disabled");
-        check_signals = false;
-      }
-      // Need to initialize check_signal_done.
-      ::sigemptyset(&check_signal_done);
-    }
-  }
-}
-
-static const char* get_signal_handler_name(address handler,
-                                           char* buf, int buflen) {
-  int offset;
-  bool found = os::dll_address_to_library_name(handler, buf, buflen, &offset);
-  if (found) {
-    // skip directory names
-    const char *p1, *p2;
-    p1 = buf;
-    size_t len = strlen(os::file_separator());
-    while ((p2 = strstr(p1, os::file_separator())) != NULL) p1 = p2 + len;
-    // The way os::dll_address_to_library_name is implemented on Aix
-    // right now, it always returns -1 for the offset which is not
-    // terribly informative.
-    // Will fix that. For now, omit the offset.
-    jio_snprintf(buf, buflen, "%s", p1);
-  } else {
-    jio_snprintf(buf, buflen, PTR_FORMAT, handler);
-  }
-  return buf;
-}
-
-static void print_signal_handler(outputStream* st, int sig,
-                                 char* buf, size_t buflen) {
-  struct sigaction sa;
-  sigaction(sig, NULL, &sa);
-
-  st->print("%s: ", os::exception_name(sig, buf, buflen));
-
-  address handler = (sa.sa_flags & SA_SIGINFO)
-    ? CAST_FROM_FN_PTR(address, sa.sa_sigaction)
-    : CAST_FROM_FN_PTR(address, sa.sa_handler);
-
-  if (handler == CAST_FROM_FN_PTR(address, SIG_DFL)) {
-    st->print("SIG_DFL");
-  } else if (handler == CAST_FROM_FN_PTR(address, SIG_IGN)) {
-    st->print("SIG_IGN");
-  } else {
-    st->print("[%s]", get_signal_handler_name(handler, buf, buflen));
-  }
-
-  // Print readable mask.
-  st->print(", sa_mask[0]=");
-  os::Posix::print_signal_set_short(st, &sa.sa_mask);
-
-  address rh = VMError::get_resetted_sighandler(sig);
-  // May be, handler was resetted by VMError?
-  if (rh != NULL) {
-    handler = rh;
-    sa.sa_flags = VMError::get_resetted_sigflags(sig);
-  }
-
-  // Print textual representation of sa_flags.
-  st->print(", sa_flags=");
-  os::Posix::print_sa_flags(st, sa.sa_flags);
-
-  // Check: is it our handler?
-  if (handler == CAST_FROM_FN_PTR(address, (sa_sigaction_t)javaSignalHandler) ||
-      handler == CAST_FROM_FN_PTR(address, (sa_sigaction_t)SR_handler)) {
-    // It is our signal handler.
-    // Check for flags, reset system-used one!
-    if ((int)sa.sa_flags != os::Aix::get_our_sigflags(sig)) {
-      st->print(", flags was changed from " PTR32_FORMAT ", consider using jsig library",
-                os::Aix::get_our_sigflags(sig));
-    }
-  }
-  st->cr();
-}
-
-#define DO_SIGNAL_CHECK(sig) \
-  if (!sigismember(&check_signal_done, sig)) \
-    os::Aix::check_signal_handler(sig)
-
-// This method is a periodic task to check for misbehaving JNI applications
-// under CheckJNI, we can add any periodic checks here
-
-void os::run_periodic_checks() {
-
-  if (check_signals == false) return;
-
-  // SEGV and BUS if overridden could potentially prevent
-  // generation of hs*.log in the event of a crash, debugging
-  // such a case can be very challenging, so we absolutely
-  // check the following for a good measure:
-  DO_SIGNAL_CHECK(SIGSEGV);
-  DO_SIGNAL_CHECK(SIGILL);
-  DO_SIGNAL_CHECK(SIGFPE);
-  DO_SIGNAL_CHECK(SIGBUS);
-  DO_SIGNAL_CHECK(SIGPIPE);
-  DO_SIGNAL_CHECK(SIGXFSZ);
-  if (UseSIGTRAP) {
-    DO_SIGNAL_CHECK(SIGTRAP);
-  }
-
-  // ReduceSignalUsage allows the user to override these handlers
-  // see comments at the very top and jvm_md.h
-  if (!ReduceSignalUsage) {
-    DO_SIGNAL_CHECK(SHUTDOWN1_SIGNAL);
-    DO_SIGNAL_CHECK(SHUTDOWN2_SIGNAL);
-    DO_SIGNAL_CHECK(SHUTDOWN3_SIGNAL);
-    DO_SIGNAL_CHECK(BREAK_SIGNAL);
-  }
-
-  DO_SIGNAL_CHECK(SR_signum);
-}
-
-typedef int (*os_sigaction_t)(int, const struct sigaction *, struct sigaction *);
-
-static os_sigaction_t os_sigaction = NULL;
-
-void os::Aix::check_signal_handler(int sig) {
-  char buf[O_BUFLEN];
-  address jvmHandler = NULL;
-
-  struct sigaction act;
-  if (os_sigaction == NULL) {
-    // only trust the default sigaction, in case it has been interposed
-    os_sigaction = CAST_TO_FN_PTR(os_sigaction_t, dlsym(RTLD_DEFAULT, "sigaction"));
-    if (os_sigaction == NULL) return;
-  }
-
-  os_sigaction(sig, (struct sigaction*)NULL, &act);
-
-  address thisHandler = (act.sa_flags & SA_SIGINFO)
-    ? CAST_FROM_FN_PTR(address, act.sa_sigaction)
-    : CAST_FROM_FN_PTR(address, act.sa_handler);
-
-  switch(sig) {
-  case SIGSEGV:
-  case SIGBUS:
-  case SIGFPE:
-  case SIGPIPE:
-  case SIGILL:
-  case SIGXFSZ:
-    jvmHandler = CAST_FROM_FN_PTR(address, (sa_sigaction_t)javaSignalHandler);
-    break;
-
-  case SHUTDOWN1_SIGNAL:
-  case SHUTDOWN2_SIGNAL:
-  case SHUTDOWN3_SIGNAL:
-  case BREAK_SIGNAL:
-    jvmHandler = (address)user_handler();
-    break;
-
-  default:
-    if (sig == SR_signum) {
-      jvmHandler = CAST_FROM_FN_PTR(address, (sa_sigaction_t)SR_handler);
-    } else {
-      return;
-    }
-    break;
-  }
-
-  if (thisHandler != jvmHandler) {
-    tty->print("Warning: %s handler ", exception_name(sig, buf, O_BUFLEN));
-    tty->print("expected:%s", get_signal_handler_name(jvmHandler, buf, O_BUFLEN));
-    tty->print_cr("  found:%s", get_signal_handler_name(thisHandler, buf, O_BUFLEN));
-    // No need to check this sig any longer
-    sigaddset(&check_signal_done, sig);
-    // Running under non-interactive shell, SHUTDOWN2_SIGNAL will be reassigned SIG_IGN
-    if (sig == SHUTDOWN2_SIGNAL && !isatty(fileno(stdin))) {
-      tty->print_cr("Running in non-interactive shell, %s handler is replaced by shell",
-                    exception_name(sig, buf, O_BUFLEN));
-    }
-  } else if (os::Aix::get_our_sigflags(sig) != 0 && (int)act.sa_flags != os::Aix::get_our_sigflags(sig)) {
-    tty->print("Warning: %s handler flags ", exception_name(sig, buf, O_BUFLEN));
-    tty->print("expected:");
-    os::Posix::print_sa_flags(tty, os::Aix::get_our_sigflags(sig));
-    tty->cr();
-    tty->print("  found:");
-    os::Posix::print_sa_flags(tty, act.sa_flags);
-    tty->cr();
-    // No need to check this sig any longer
-    sigaddset(&check_signal_done, sig);
-  }
-
-  // Dump all the signal
-  if (sigismember(&check_signal_done, sig)) {
-    print_signal_handlers(tty, buf, O_BUFLEN);
-  }
-}
-
 // To install functions for atexit system call
 extern "C" {
   static void perfMemory_exit_helper() {
     perfMemory_exit();
   }
+}
+
+static void set_page_size(size_t page_size) {
+  OSInfo::set_vm_page_size(page_size);
+  OSInfo::set_vm_allocation_granularity(page_size);
 }
 
 // This is called _before_ the most of global arguments have been parsed.
@@ -3447,16 +2322,16 @@ void os::init(void) {
       // -XX:-Use64KPages.
       if (Use64KPages) {
         trcVerbose("64K page mode (faked for data segment)");
-        Aix::_page_size = 64*K;
+        set_page_size(64*K);
       } else {
         trcVerbose("4K page mode (Use64KPages=off)");
-        Aix::_page_size = 4*K;
+        set_page_size(4*K);
       }
     } else {
       // .. and not able to allocate 64k pages dynamically. Here, just
       // fall back to 4K paged mode and use mmap for everything.
       trcVerbose("4K page mode");
-      Aix::_page_size = 4*K;
+      set_page_size(4*K);
       FLAG_SET_ERGO(Use64KPages, false);
     }
   } else {
@@ -3465,14 +2340,14 @@ void os::init(void) {
     // (There is one special case where this may be false: EXTSHM=on.
     // but we decided to not support that mode).
     assert0(g_multipage_support.can_use_64K_pages);
-    Aix::_page_size = 64*K;
+    set_page_size(64*K);
     trcVerbose("64K page mode");
     FLAG_SET_ERGO(Use64KPages, true);
   }
 
   // For now UseLargePages is just ignored.
   FLAG_SET_ERGO(UseLargePages, false);
-  _page_sizes[0] = 0;
+  _page_sizes.add(os::vm_page_size());
 
   // debug trace
   trcVerbose("os::vm_page_size %s", describe_pagesize(os::vm_page_size()));
@@ -3489,18 +2364,12 @@ void os::init(void) {
     libperfstat::perfstat_reset();
   }
 
-  // Now initialze basic system properties. Note that for some of the values we
+  // Now initialize basic system properties. Note that for some of the values we
   // need libperfstat etc.
   os::Aix::initialize_system_info();
 
-  clock_tics_per_sec = sysconf(_SC_CLK_TCK);
-
-  init_random(1234567);
-
   // _main_thread points to the thread that created/loaded the JVM.
   Aix::_main_thread = pthread_self();
-
-  initial_time_count = javaTimeNanos();
 
   os::Posix::init();
 }
@@ -3530,28 +2399,18 @@ jint os::init_2(void) {
     LoadedLibraries::print(tty);
   }
 
-  // initialize suspend/resume support - must do this before signal_sets_init()
-  if (SR_initialize() != 0) {
-    perror("SR_initialize failed");
+  if (PosixSignals::init() == JNI_ERR) {
     return JNI_ERR;
-  }
-
-  Aix::signal_sets_init();
-  Aix::install_signal_handlers();
-  // Initialize data for jdk.internal.misc.Signal
-  if (!ReduceSignalUsage) {
-    jdk_misc_signal_init();
   }
 
   // Check and sets minimum stack sizes against command line options
-  if (Posix::set_minimum_stack_sizes() == JNI_ERR) {
+  if (set_minimum_stack_sizes() == JNI_ERR) {
     return JNI_ERR;
   }
 
-  if (UseNUMA) {
-    UseNUMA = false;
-    warning("NUMA optimizations are not available on this OS.");
-  }
+  // Not supported.
+  FLAG_SET_ERGO(UseNUMA, false);
+  FLAG_SET_ERGO(UseNUMAInterleaving, false);
 
   if (MaxFDLimit) {
     // Set the number of file descriptors to max. print out error
@@ -3589,21 +2448,6 @@ jint os::init_2(void) {
   return JNI_OK;
 }
 
-// Mark the polling page as unreadable
-void os::make_polling_page_unreadable(void) {
-  if (!guard_memory((char*)_polling_page, Aix::page_size())) {
-    fatal("Could not disable polling page");
-  }
-};
-
-// Mark the polling page as readable
-void os::make_polling_page_readable(void) {
-  // Changed according to os_linux.cpp.
-  if (!checked_mprotect((char *)_polling_page, Aix::page_size(), PROT_READ)) {
-    fatal("Could not enable polling page at " PTR_FORMAT, _polling_page);
-  }
-};
-
 int os::active_processor_count() {
   // User has overridden the number of active processors
   if (ActiveProcessorCount > 0) {
@@ -3623,19 +2467,6 @@ void os::set_native_thread_name(const char *name) {
   return;
 }
 
-bool os::bind_to_processor(uint processor_id) {
-  // Not yet implemented.
-  return false;
-}
-
-void os::SuspendedThreadTask::internal_do_task() {
-  if (do_suspend(_thread->osthread())) {
-    SuspendedThreadTaskContext context(_thread, _thread->osthread()->ucontext());
-    do_task(context);
-    do_resume(_thread->osthread());
-  }
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 // debug support
 
@@ -3644,8 +2475,8 @@ bool os::find(address addr, outputStream* st) {
   st->print(PTR_FORMAT ": ", addr);
 
   loaded_module_t lm;
-  if (LoadedLibraries::find_for_text_address(addr, &lm) != NULL ||
-      LoadedLibraries::find_for_data_address(addr, &lm) != NULL) {
+  if (LoadedLibraries::find_for_text_address(addr, &lm) ||
+      LoadedLibraries::find_for_data_address(addr, &lm)) {
     st->print_cr("%s", lm.path);
     return true;
   }
@@ -3661,49 +2492,8 @@ bool os::find(address addr, outputStream* st) {
 // on, e.g., Win32.
 void
 os::os_exception_wrapper(java_call_t f, JavaValue* value, const methodHandle& method,
-                         JavaCallArguments* args, Thread* thread) {
+                         JavaCallArguments* args, JavaThread* thread) {
   f(value, method, args, thread);
-}
-
-void os::print_statistics() {
-}
-
-bool os::message_box(const char* title, const char* message) {
-  int i;
-  fdStream err(defaultStream::error_fd());
-  for (i = 0; i < 78; i++) err.print_raw("=");
-  err.cr();
-  err.print_raw_cr(title);
-  for (i = 0; i < 78; i++) err.print_raw("-");
-  err.cr();
-  err.print_raw_cr(message);
-  for (i = 0; i < 78; i++) err.print_raw("=");
-  err.cr();
-
-  char buf[16];
-  // Prevent process from exiting upon "read error" without consuming all CPU
-  while (::read(0, buf, sizeof(buf)) <= 0) { ::sleep(100); }
-
-  return buf[0] == 'y' || buf[0] == 'Y';
-}
-
-// Is a (classpath) directory empty?
-bool os::dir_is_empty(const char* path) {
-  DIR *dir = NULL;
-  struct dirent *ptr;
-
-  dir = opendir(path);
-  if (dir == NULL) return true;
-
-  /* Scan the directory */
-  bool result = true;
-  while (result && (ptr = readdir(dir)) != NULL) {
-    if (strcmp(ptr->d_name, ".") != 0 && strcmp(ptr->d_name, "..") != 0) {
-      result = false;
-    }
-  }
-  closedir(dir);
-  return result;
 }
 
 // This code originates from JDK's sysOpen and open64_w
@@ -3715,10 +2505,18 @@ int os::open(const char *path, int oflag, int mode) {
     errno = ENAMETOOLONG;
     return -1;
   }
-  int fd;
+  // AIX 7.X now supports O_CLOEXEC too, like modern Linux; but we have to be careful, see
+  // IV90804: OPENING A FILE IN AFS WITH O_CLOEXEC FAILS WITH AN EINVAL ERROR APPLIES TO AIX 7100-04 17/04/14 PTF PECHANGE
+  int oflag_with_o_cloexec = oflag | O_CLOEXEC;
 
-  fd = ::open64(path, oflag, mode);
-  if (fd == -1) return -1;
+  int fd = ::open64(path, oflag_with_o_cloexec, mode);
+  if (fd == -1) {
+    // we might fail in the open call when O_CLOEXEC is set, so try again without (see IV90804)
+    fd = ::open64(path, oflag, mode);
+    if (fd == -1) {
+      return -1;
+    }
+  }
 
   // If the open succeeded, the file might still be a directory.
   {
@@ -3750,21 +2548,25 @@ int os::open(const char *path, int oflag, int mode) {
   //
   // - might cause an fopen in the subprocess to fail on a system
   //   suffering from bug 1085341.
-  //
-  // (Yes, the default setting of the close-on-exec flag is a Unix
-  // design flaw.)
-  //
-  // See:
-  // 1085341: 32-bit stdio routines should support file descriptors >255
-  // 4843136: (process) pipe file descriptor from Runtime.exec not being closed
-  // 6339493: (process) Runtime.exec does not close all file descriptors on Solaris 9
-#ifdef FD_CLOEXEC
-  {
+
+  // Validate that the use of the O_CLOEXEC flag on open above worked.
+  static sig_atomic_t O_CLOEXEC_is_known_to_work = 0;
+  if (O_CLOEXEC_is_known_to_work == 0) {
     int flags = ::fcntl(fd, F_GETFD);
-    if (flags != -1)
+    if (flags != -1) {
+      if ((flags & FD_CLOEXEC) != 0) {
+        O_CLOEXEC_is_known_to_work = 1;
+      } else { // it does not work
+        ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+        O_CLOEXEC_is_known_to_work = -1;
+      }
+    }
+  } else if (O_CLOEXEC_is_known_to_work == -1) {
+    int flags = ::fcntl(fd, F_GETFD);
+    if (flags != -1) {
       ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+    }
   }
-#endif
 
   return fd;
 }
@@ -3772,9 +2574,7 @@ int os::open(const char *path, int oflag, int mode) {
 // create binary file, rewriting existing file if required
 int os::create_binary_file(const char* path, bool rewrite_existing) {
   int oflags = O_WRONLY | O_CREAT;
-  if (!rewrite_existing) {
-    oflags |= O_EXCL;
-  }
+  oflags |= rewrite_existing ? O_TRUNC : O_EXCL;
   return ::open64(path, oflags, S_IREAD | S_IWRITE);
 }
 
@@ -3786,35 +2586,6 @@ jlong os::current_file_offset(int fd) {
 // move file pointer to the specified offset
 jlong os::seek_to_file_offset(int fd, jlong offset) {
   return (jlong)::lseek64(fd, (off64_t)offset, SEEK_SET);
-}
-
-// This code originates from JDK's sysAvailable
-// from src/solaris/hpi/src/native_threads/src/sys_api_td.c
-
-int os::available(int fd, jlong *bytes) {
-  jlong cur, end;
-  int mode;
-  struct stat64 buf64;
-
-  if (::fstat64(fd, &buf64) >= 0) {
-    mode = buf64.st_mode;
-    if (S_ISCHR(mode) || S_ISFIFO(mode) || S_ISSOCK(mode)) {
-      int n;
-      if (::ioctl(fd, FIONREAD, &n) >= 0) {
-        *bytes = n;
-        return 1;
-      }
-    }
-  }
-  if ((cur = ::lseek64(fd, 0L, SEEK_CUR)) == -1) {
-    return 0;
-  } else if ((end = ::lseek64(fd, 0L, SEEK_END)) == -1) {
-    return 0;
-  } else if (::lseek64(fd, cur, SEEK_SET) == -1) {
-    return 0;
-  }
-  *bytes = end - cur;
-  return 1;
 }
 
 // Map a block of memory.
@@ -3836,7 +2607,7 @@ char* os::pd_map_memory(int fd, const char* file_name, size_t file_offset,
     prot |= PROT_EXEC;
   }
 
-  if (addr != NULL) {
+  if (addr != nullptr) {
     flags |= MAP_FIXED;
   }
 
@@ -3848,7 +2619,7 @@ char* os::pd_map_memory(int fd, const char* file_name, size_t file_offset,
   char* mapped_address = (char*)::mmap(addr, (size_t)bytes, prot, flags,
                                      fd, file_offset);
   if (mapped_address == MAP_FAILED) {
-    return NULL;
+    return nullptr;
   }
   return mapped_address;
 }
@@ -4019,26 +2790,6 @@ int os::loadavg(double values[], int nelem) {
   }
 }
 
-void os::pause() {
-  char filename[MAX_PATH];
-  if (PauseAtStartupFile && PauseAtStartupFile[0]) {
-    jio_snprintf(filename, MAX_PATH, "%s", PauseAtStartupFile);
-  } else {
-    jio_snprintf(filename, MAX_PATH, "./vm.paused.%d", current_process_id());
-  }
-
-  int fd = ::open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-  if (fd != -1) {
-    struct stat buf;
-    ::close(fd);
-    while (::stat(filename, &buf) == 0) {
-      (void)::poll(NULL, 0, 100);
-    }
-  } else {
-    trcVerbose("Could not open pause file '%s', continuing immediately.", filename);
-  }
-}
-
 bool os::is_primordial_thread(void) {
   if (pthread_self() == (pthread_t)1) {
     return true;
@@ -4109,7 +2860,7 @@ void os::Aix::scan_environment() {
   char* p;
   int rc;
 
-  // Warn explicity if EXTSHM=ON is used. That switch changes how
+  // Warn explicitly if EXTSHM=ON is used. That switch changes how
   // System V shared memory behaves. One effect is that page size of
   // shared memory cannot be change dynamically, effectivly preventing
   // large pages from working.
@@ -4196,87 +2947,22 @@ void os::Aix::initialize_libperfstat() {
 /////////////////////////////////////////////////////////////////////////////
 // thread stack
 
-// Get the current stack base from the OS (actually, the pthread library).
-// Note: usually not page aligned.
-address os::current_stack_base() {
-  AixMisc::stackbounds_t bounds;
-  bool rc = AixMisc::query_stack_bounds_for_current_thread(&bounds);
-  guarantee(rc, "Unable to retrieve stack bounds.");
-  return bounds.base;
-}
-
-// Get the current stack size from the OS (actually, the pthread library).
+// Get the current stack base and size from the OS (actually, the pthread library).
+// Note: base usually not page aligned.
 // Returned size is such that (base - size) is always aligned to page size.
-size_t os::current_stack_size() {
+void os::current_stack_base_and_size(address* stack_base, size_t* stack_size) {
   AixMisc::stackbounds_t bounds;
   bool rc = AixMisc::query_stack_bounds_for_current_thread(&bounds);
   guarantee(rc, "Unable to retrieve stack bounds.");
-  // Align the returned stack size such that the stack low address
+  *stack_base = bounds.base;
+
+  // Align the reported stack size such that the stack low address
   // is aligned to page size (Note: base is usually not and we do not care).
   // We need to do this because caller code will assume stack low address is
   // page aligned and will place guard pages without checking.
   address low = bounds.base - bounds.size;
   address low_aligned = (address)align_up(low, os::vm_page_size());
-  size_t s = bounds.base - low_aligned;
-  return s;
-}
-
-extern char** environ;
-
-// Run the specified command in a separate process. Return its exit value,
-// or -1 on failure (e.g. can't fork a new process).
-// Unlike system(), this function can be called from signal handler. It
-// doesn't block SIGINT et al.
-int os::fork_and_exec(char* cmd, bool use_vfork_if_available) {
-  char* argv[4] = { (char*)"sh", (char*)"-c", cmd, NULL};
-
-  pid_t pid = fork();
-
-  if (pid < 0) {
-    // fork failed
-    return -1;
-
-  } else if (pid == 0) {
-    // child process
-
-    // Try to be consistent with system(), which uses "/usr/bin/sh" on AIX.
-    execve("/usr/bin/sh", argv, environ);
-
-    // execve failed
-    _exit(-1);
-
-  } else {
-    // copied from J2SE ..._waitForProcessExit() in UNIXProcess_md.c; we don't
-    // care about the actual exit code, for now.
-
-    int status;
-
-    // Wait for the child process to exit. This returns immediately if
-    // the child has already exited. */
-    while (waitpid(pid, &status, 0) < 0) {
-      switch (errno) {
-        case ECHILD: return 0;
-        case EINTR: break;
-        default: return -1;
-      }
-    }
-
-    if (WIFEXITED(status)) {
-      // The child exited normally; get its exit code.
-      return WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-      // The child exited because of a signal.
-      // The best value to return is 0x80 + signal number,
-      // because that is what all Unix shells do, and because
-      // it allows callers to distinguish between process exit and
-      // process death by signal.
-      return 0x80 + WTERMSIG(status);
-    } else {
-      // Unknown exit code; pass it through.
-      return status;
-    }
-  }
-  return -1;
+  *stack_size = bounds.base - low_aligned;
 }
 
 // Get the default path to the core file
@@ -4284,22 +2970,16 @@ int os::fork_and_exec(char* cmd, bool use_vfork_if_available) {
 int os::get_core_path(char* buffer, size_t bufferSize) {
   const char* p = get_current_directory(buffer, bufferSize);
 
-  if (p == NULL) {
-    assert(p != NULL, "failed to get current directory");
+  if (p == nullptr) {
+    assert(p != nullptr, "failed to get current directory");
     return 0;
   }
 
   jio_snprintf(buffer, bufferSize, "%s/core or core.%d",
                                                p, current_process_id());
 
-  return strlen(buffer);
+  return checked_cast<int>(strlen(buffer));
 }
-
-#ifndef PRODUCT
-void TestReserveMemorySpecial_test() {
-  // No tests available for this platform
-}
-#endif
 
 bool os::start_debugging(char *buf, int buflen) {
   int len = (int)strlen(buf);
@@ -4336,9 +3016,46 @@ static inline time_t get_mtime(const char* filename) {
 int os::compare_file_modified_times(const char* file1, const char* file2) {
   time_t t1 = get_mtime(file1);
   time_t t2 = get_mtime(file2);
-  return t1 - t2;
+  return primitive_compare(t1, t2);
 }
 
 bool os::supports_map_sync() {
   return false;
+}
+
+void os::print_memory_mappings(char* addr, size_t bytes, outputStream* st) {}
+
+#if INCLUDE_JFR
+
+void os::jfr_report_memory_info() {}
+
+#endif // INCLUDE_JFR
+
+// Simulate the library search algorithm of dlopen() (in os::dll_load)
+int os::Aix::stat64x_via_LIBPATH(const char* path, struct stat64x* stat) {
+  if (path[0] == '/' ||
+      (path[0] == '.' && (path[1] == '/' ||
+                          (path[1] == '.' && path[2] == '/')))) {
+    return stat64x(path, stat);
+  }
+
+  const char* env = getenv("LIBPATH");
+  if (env == nullptr || *env == 0)
+    return -1;
+
+  int ret = -1;
+  size_t libpathlen = strlen(env);
+  char* libpath = NEW_C_HEAP_ARRAY(char, libpathlen + 1, mtServiceability);
+  char* combined = NEW_C_HEAP_ARRAY(char, libpathlen + strlen(path) + 1, mtServiceability);
+  char *saveptr, *token;
+  strcpy(libpath, env);
+  for (token = strtok_r(libpath, ":", &saveptr); token != nullptr; token = strtok_r(nullptr, ":", &saveptr)) {
+    sprintf(combined, "%s/%s", token, path);
+    if (0 == (ret = stat64x(combined, stat)))
+      break;
+  }
+
+  FREE_C_HEAP_ARRAY(char*, combined);
+  FREE_C_HEAP_ARRAY(char*, libpath);
+  return ret;
 }

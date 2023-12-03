@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2016, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2016, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -37,7 +37,6 @@ import java.util.Set;
  * module's content.
  *
  * @since 9
- * @spec JPMS
  * @see Configuration#modules()
  */
 public final class ResolvedModule {
@@ -79,7 +78,7 @@ public final class ResolvedModule {
      * @return The module descriptor
      */
     ModuleDescriptor descriptor() {
-        return reference().descriptor();
+        return mref.descriptor();
     }
 
     /**
@@ -93,11 +92,13 @@ public final class ResolvedModule {
      * @return The module name
      */
     public String name() {
-        return reference().descriptor().name();
+        return mref.descriptor().name();
     }
 
     /**
      * Returns the set of resolved modules that this resolved module reads.
+     * The readability relation is reflexive (every module reads itself). The
+     * set of resolved modules returned by this method does not include itself.
      *
      * @return A possibly-empty unmodifiable set of resolved modules that
      *         this resolved module reads
@@ -139,12 +140,9 @@ public final class ResolvedModule {
      */
     @Override
     public boolean equals(Object ob) {
-        if (!(ob instanceof ResolvedModule))
-            return false;
-
-        ResolvedModule that = (ResolvedModule) ob;
-        return Objects.equals(this.cf, that.cf)
-                && Objects.equals(this.mref, that.mref);
+        return (ob instanceof ResolvedModule that)
+            && Objects.equals(this.cf, that.cf)
+            && Objects.equals(this.mref, that.mref);
     }
 
     /**

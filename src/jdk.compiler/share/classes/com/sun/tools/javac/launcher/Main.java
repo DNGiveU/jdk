@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -38,6 +38,7 @@ import java.io.OutputStreamWriter;
 import java.io.PrintStream;
 import java.io.PrintWriter;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.net.MalformedURLException;
@@ -64,8 +65,6 @@ import java.util.Map;
 import java.util.MissingResourceException;
 import java.util.NoSuchElementException;
 import java.util.ResourceBundle;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
 
 import javax.lang.model.SourceVersion;
 import javax.lang.model.element.NestingKind;
@@ -86,6 +85,8 @@ import com.sun.tools.javac.code.Source;
 import com.sun.tools.javac.resources.LauncherProperties.Errors;
 import com.sun.tools.javac.util.JCDiagnostic.Error;
 
+import jdk.internal.misc.MethodFinder;
+import jdk.internal.misc.PreviewFeatures;
 import jdk.internal.misc.VM;
 
 import static javax.tools.JavaFileObject.Kind.SOURCE;
@@ -121,7 +122,7 @@ public class Main {
      * arguments to the main method of the first class found in the file.
      *
      * <p>If any problem occurs before executing the main class, it will
-     * be reported to the standard error stream, and the the JVM will be
+     * be reported to the standard error stream, and the JVM will be
      * terminated by calling {@code System.exit} with a non-zero return code.
      *
      * @param args the arguments
@@ -129,13 +130,15 @@ public class Main {
      */
     public static void main(String... args) throws Throwable {
         try {
-            new Main(System.err).run(VM.getRuntimeArguments(), args);
+            new Main(System.err)
+                    .checkSecurityManager()
+                    .run(VM.getRuntimeArguments(), args);
         } catch (Fault f) {
             System.err.println(f.getMessage());
             System.exit(1);
         } catch (InvocationTargetException e) {
             // leave VM to handle the stacktrace, in the standard manner
-            throw e.getTargetException();
+            throw e.getCause();
         }
     }
 
@@ -160,6 +163,19 @@ public class Main {
      */
     public Main(PrintWriter out) {
         this.out = out;
+    }
+
+    /**
+     * Checks if a security manager is present and throws an exception if so.
+     * @return this object
+     * @throws Fault if a security manager is present
+     */
+    @SuppressWarnings("removal")
+    private Main checkSecurityManager() throws Fault {
+        if (System.getSecurityManager() != null) {
+            throw new Fault(Errors.SecurityManager);
+        }
+        return this;
     }
 
     /**
@@ -188,8 +204,8 @@ public class Main {
         Context context = new Context(file.toAbsolutePath());
         String mainClassName = compile(file, getJavacOpts(runtimeArgs), context);
 
-        String[] appArgs = Arrays.copyOfRange(args, 1, args.length);
-        execute(mainClassName, appArgs, context);
+        String[] mainArgs = Arrays.copyOfRange(args, 1, args.length);
+        execute(mainClassName, mainArgs, context);
     }
 
     /**
@@ -342,13 +358,20 @@ public class Main {
                     }
                     break;
                 default:
+                    if (opt.startsWith("-agentlib:jdwp=") || opt.startsWith("-Xrunjdwp:")) {
+                        javacOpts.add("-g");
+                    }
                     // ignore all other runtime args
             }
         }
 
         // add implicit options
         javacOpts.add("-proc:none");
-
+        javacOpts.add("-Xdiags:verbose");
+        javacOpts.add("-Xlint:deprecation");
+        javacOpts.add("-Xlint:unchecked");
+        javacOpts.add("-Xlint:-options");
+        javacOpts.add("-XDsourceLauncher");
         return javacOpts;
     }
 
@@ -383,7 +406,9 @@ public class Main {
         if (l.mainClass == null) {
             throw new Fault(Errors.NoClass);
         }
-        String mainClassName = l.mainClass.getQualifiedName().toString();
+        TypeElement mainClass = l.mainClass;
+        String mainClassName = mainClass.getQualifiedName().toString();
+
         return mainClassName;
     }
 
@@ -392,37 +417,65 @@ public class Main {
      * will load recently compiled classes from memory.
      *
      * @param mainClassName the class to be executed
-     * @param appArgs the arguments for the {@code main} method
+     * @param mainArgs the arguments for the {@code main} method
      * @param context the context for the class to be executed
      * @throws Fault if there is a problem finding or invoking the {@code main} method
      * @throws InvocationTargetException if the {@code main} method throws an exception
      */
-    private void execute(String mainClassName, String[] appArgs, Context context)
+    private void execute(String mainClassName, String[] mainArgs, Context context)
             throws Fault, InvocationTargetException {
         System.setProperty("jdk.launcher.sourcefile", context.file.toString());
         ClassLoader cl = context.getClassLoader(ClassLoader.getSystemClassLoader());
+
+        Class<?> appClass;
         try {
-            Class<?> appClass = Class.forName(mainClassName, true, cl);
-            Method main = appClass.getDeclaredMethod("main", String[].class);
-            int PUBLIC_STATIC = Modifier.PUBLIC | Modifier.STATIC;
-            if ((main.getModifiers() & PUBLIC_STATIC) != PUBLIC_STATIC) {
-                throw new Fault(Errors.MainNotPublicStatic);
-            }
-            if (!main.getReturnType().equals(void.class)) {
-                throw new Fault(Errors.MainNotVoid);
-            }
-            main.setAccessible(true);
-            main.invoke(0, (Object) appArgs);
+            appClass = Class.forName(mainClassName, true, cl);
         } catch (ClassNotFoundException e) {
             throw new Fault(Errors.CantFindClass(mainClassName));
-        } catch (NoSuchMethodException e) {
+        }
+
+        Method mainMethod = MethodFinder.findMainMethod(appClass);
+
+        if (mainMethod == null) {
             throw new Fault(Errors.CantFindMainMethod(mainClassName));
+        }
+
+        boolean isStatic = Modifier.isStatic(mainMethod.getModifiers());
+        Object instance = null;
+
+        if (!isStatic) {
+            Constructor<?> constructor;
+            try {
+                constructor = appClass.getDeclaredConstructor();
+            } catch (NoSuchMethodException e) {
+                throw new Fault(Errors.CantFindConstructor(mainClassName));
+            }
+
+            try {
+                constructor.setAccessible(true);
+                instance = constructor.newInstance();
+            } catch (InstantiationException | IllegalAccessException e) {
+                throw new Fault(Errors.CantAccessConstructor(mainClassName));
+            }
+        }
+
+        try {
+            // Similar to sun.launcher.LauncherHelper#executeMainClass
+            // but duplicated here to prevent additional launcher frames
+            mainMethod.setAccessible(true);
+            Object receiver = isStatic ? appClass : instance;
+
+            if (mainMethod.getParameterCount() == 0) {
+                mainMethod.invoke(receiver);
+            } else {
+                mainMethod.invoke(receiver, (Object)mainArgs);
+            }
         } catch (IllegalAccessException e) {
             throw new Fault(Errors.CantAccessMainMethod(mainClassName));
         } catch (InvocationTargetException e) {
             // remove stack frames for source launcher
             int invocationFrames = e.getStackTrace().length;
-            Throwable target = e.getTargetException();
+            Throwable target = e.getCause();
             StackTraceElement[] targetTrace = target.getStackTrace();
             target.setStackTrace(Arrays.copyOfRange(targetTrace, 0, targetTrace.length - invocationFrames));
             throw e;
@@ -477,7 +530,7 @@ public class Main {
     }
 
     /**
-     * An object to encapulate the set of in-memory classes, such that
+     * An object to encapsulate the set of in-memory classes, such that
      * they can be written by a file manager and subsequently used by
      * a class loader.
      */
@@ -670,7 +723,9 @@ public class Main {
             }
 
             try {
-                return new URL(PROTOCOL, null, -1, name, handler);
+                @SuppressWarnings("deprecation")
+                var result = new URL(PROTOCOL, null, -1, name, handler);
+                return result;
             } catch (MalformedURLException e) {
                 return null;
             }

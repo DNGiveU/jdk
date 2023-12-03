@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2003, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -30,7 +30,20 @@
 
 #warn This file is preprocessed before being compiled
 
+#if[byte]
+import java.io.IOException;
+import java.io.UncheckedIOException;
+#end[byte]
 import java.nio.*;
+#if[byte]
+import java.nio.channels.FileChannel;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Random;
+#end[byte]
+#if[char]
+import java.util.function.IntFunction;
+#end[char]
 
 
 public class Basic$Type$
@@ -469,6 +482,73 @@ public class Basic$Type$
                 }
             }
         }
+
+        // mapped buffers
+        try {
+            for (MappedByteBuffer bb : mappedBuffers()) {
+                try {
+                    int offset = bb.alignmentOffset(1, 4);
+                    ck(bb, offset >= 0);
+                } catch (UnsupportedOperationException e) {
+                    System.out.println("Not applicable, UOE thrown: ");
+                }
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+
+        // alignment identities
+        final int maxPow2 = 12;
+        ByteBuffer bb = ByteBuffer.allocateDirect(1 << maxPow2); // cap 4096
+
+        Random rnd = new Random();
+        long seed = rnd.nextLong();
+        rnd = new Random(seed);
+
+        for (int i = 0; i < 100; i++) {
+            // 1 == 2^0 <= unitSize == 2^k <= bb.capacity()/2
+            int unitSize = 1 << rnd.nextInt(maxPow2);
+            // 0 <= index < 2*unitSize
+            int index = rnd.nextInt(unitSize << 1);
+            int value = bb.alignmentOffset(index, unitSize);
+            try {
+                if (value < 0 || value >= unitSize) {
+                    throw new RuntimeException(value + " < 0 || " +
+                        value + " >= " + unitSize);
+                }
+                if (value <= index &&
+                    bb.alignmentOffset(index - value, unitSize) != 0)
+                    throw new RuntimeException("Identity 1");
+                if (bb.alignmentOffset(index + (unitSize - value),
+                    unitSize) != 0)
+                    throw new RuntimeException("Identity 2");
+            } catch (RuntimeException re) {
+                System.err.format("seed %d, index %d, unitSize %d, value %d%n",
+                    seed, index, unitSize, value);
+                throw re;
+            }
+        }
+    }
+
+    private static MappedByteBuffer[] mappedBuffers() throws IOException {
+        return new MappedByteBuffer[]{
+                createMappedBuffer(new byte[]{0, 1, 2, 3}),
+                createMappedBuffer(new byte[]{0, 1, 2, -3,
+                    45, 6, 7, 78, 3, -7, 6, 7, -128, 127}),
+        };
+    }
+
+    private static MappedByteBuffer createMappedBuffer(byte[] contents)
+        throws IOException {
+        Path tempFile = Files.createTempFile("mbb", null);
+        tempFile.toFile().deleteOnExit();
+        Files.write(tempFile, contents);
+        try (FileChannel fc = FileChannel.open(tempFile)) {
+            MappedByteBuffer map =
+                fc.map(FileChannel.MapMode.READ_ONLY, 0, contents.length);
+            map.load();
+            return map;
+        }
     }
 #end[byte]
 
@@ -550,6 +630,60 @@ public class Basic$Type$
         absBulkGet(b);
 
 #if[char]
+        // 8306623 and 8306959
+        String str = "in violet night walking beneath a reign of uncouth stars";
+        char[] chars = str.toCharArray();
+        int cslen = chars.length;
+        CharSequence[] csqs = new CharSequence[] {
+            str,
+            new StringBuffer(str),
+            new StringBuilder(str),
+            CharBuffer.wrap(chars),
+            ByteBuffer.allocateDirect(2*chars.length).asCharBuffer()
+        };
+
+        int[][] bounds = new int[][] {
+            {-1, cslen},         // negative start
+            {0, -1},             // negative end
+            {1, 0},              // start > end
+            {cslen/2, cslen + 1} // end > cslen
+        };
+
+        IntFunction<CharBuffer>[] producers = new IntFunction[] {
+            (i) -> CharBuffer.allocate(i),
+            (i) -> ByteBuffer.allocateDirect(2*i).asCharBuffer()
+        };
+
+        for (IntFunction<CharBuffer> f : producers) {
+            for (CharSequence csq : csqs) {
+                // append() should throw BufferOverflowException
+                final CharBuffer cbBOE = f.apply(cslen/8);
+                tryCatch(cbBOE, BufferOverflowException.class, () ->
+                    cbBOE.append(csq, cslen/4, cslen/2));
+
+                CharBuffer cb = f.apply(7);
+                tryCatch(cbBOE, BufferOverflowException.class, () ->
+                    cb.append(csq.subSequence(0, 8), 0, 8));
+
+                // append() should throw IndexOutOfBoundsException
+                final CharBuffer cbIOOBE = f.apply(cslen + 1);
+                for (int[] bds : bounds)
+                    tryCatch(cbIOOBE, IndexOutOfBoundsException.class, () ->
+                        cbIOOBE.append(csq, bds[0], bds[1]));
+
+                tryCatch(cb, IndexOutOfBoundsException.class, () ->
+                    cb.append(csq.subSequence(0, 8), 4, 12));
+
+                // should append nothing
+                int rem = cb.remaining();
+                ck(cb, cb.append(csq, 0, 0).remaining(), rem);
+
+                // should fill the buffer
+                int start = (csq.length() - rem)/2;
+                ck(cb, cb.append(csq, start, start + rem).remaining(), 0);
+            }
+        }
+        // end 8306623 and 8306959
 
         bulkPutString(b);
         relGet(b);
@@ -1057,6 +1191,26 @@ public class Basic$Type$
 #end[byte]
     }
 
+    public static void testToString() {
+        final int cap = 10;
+
+#if[byte]
+        $Type$Buffer direct1 = $Type$Buffer.allocateDirect(cap);
+        if (!direct1.toString().equals(Basic.toString(direct1))) {
+           fail("Direct buffer toString is incorrect: "
+                  + direct1.toString() + " vs " + Basic.toString(direct1));
+        }
+#end[byte]
+
+#if[!char]
+        $Type$Buffer nondirect1 = $Type$Buffer.allocate(cap);
+        if (!nondirect1.toString().equals(Basic.toString(nondirect1))) {
+           fail("Heap buffer toString is incorrect: "
+                  + nondirect1.toString() + " vs " + Basic.toString(nondirect1));
+        }
+#end[!char]
+    }
+
     public static void test() {
         testAllocate();
         test(0, $Type$Buffer.allocate(7 * 1024), false);
@@ -1078,6 +1232,8 @@ public class Basic$Type$
 #else[byte]
         putBuffer();
 #end[byte]
+
+        testToString();
     }
 
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -24,47 +24,56 @@
 #ifndef OS_LINUX_GC_Z_ZPHYSICALMEMORYBACKING_LINUX_HPP
 #define OS_LINUX_GC_Z_ZPHYSICALMEMORYBACKING_LINUX_HPP
 
-#include "gc/z/zBackingFile_linux.hpp"
-#include "gc/z/zMemory.hpp"
+#include "gc/z/zAddress.hpp"
 
 class ZErrno;
-class ZPhysicalMemory;
 
 class ZPhysicalMemoryBacking {
 private:
-  ZBackingFile   _file;
-  ZMemoryManager _committed;
-  ZMemoryManager _uncommitted;
+  int      _fd;
+  size_t   _size;
+  uint64_t _filesystem;
+  size_t   _block_size;
+  size_t   _available;
+  bool     _initialized;
 
-  void warn_available_space(size_t max) const;
-  void warn_max_map_count(size_t max) const;
+  void warn_available_space(size_t max_capacity) const;
+  void warn_max_map_count(size_t max_capacity) const;
 
-  void map_failed(ZErrno err) const;
+  int create_mem_fd(const char* name) const;
+  int create_file_fd(const char* name) const;
+  int create_fd(const char* name) const;
 
-  void advise_view(uintptr_t addr, size_t size, int advice) const;
-  void pretouch_view(uintptr_t addr, size_t size) const;
-  void map_view(const ZPhysicalMemory& pmem, uintptr_t addr, bool pretouch) const;
-  void unmap_view(const ZPhysicalMemory& pmem, uintptr_t addr) const;
+  bool is_tmpfs() const;
+  bool is_hugetlbfs() const;
+  bool tmpfs_supports_transparent_huge_pages() const;
+
+  ZErrno fallocate_compat_mmap_hugetlbfs(zoffset offset, size_t length, bool touch) const;
+  ZErrno fallocate_compat_mmap_tmpfs(zoffset offset, size_t length) const;
+  ZErrno fallocate_compat_pwrite(zoffset offset, size_t length) const;
+  ZErrno fallocate_fill_hole_compat(zoffset offset, size_t length) const;
+  ZErrno fallocate_fill_hole_syscall(zoffset offset, size_t length) const;
+  ZErrno fallocate_fill_hole(zoffset offset, size_t length) const;
+  ZErrno fallocate_punch_hole(zoffset offset, size_t length) const;
+  ZErrno split_and_fallocate(bool punch_hole, zoffset offset, size_t length) const;
+  ZErrno fallocate(bool punch_hole, zoffset offset, size_t length) const;
+
+  bool commit_inner(zoffset offset, size_t length) const;
+  size_t commit_numa_interleaved(zoffset offset, size_t length) const;
+  size_t commit_default(zoffset offset, size_t length) const;
 
 public:
+  ZPhysicalMemoryBacking(size_t max_capacity);
+
   bool is_initialized() const;
 
-  void warn_commit_limits(size_t max) const;
-  bool supports_uncommit();
+  void warn_commit_limits(size_t max_capacity) const;
 
-  size_t commit(size_t size);
-  size_t uncommit(size_t size);
+  size_t commit(zoffset offset, size_t length) const;
+  size_t uncommit(zoffset offset, size_t length) const;
 
-  ZPhysicalMemory alloc(size_t size);
-  void free(const ZPhysicalMemory& pmem);
-
-  uintptr_t nmt_address(uintptr_t offset) const;
-
-  void map(const ZPhysicalMemory& pmem, uintptr_t offset) const;
-  void unmap(const ZPhysicalMemory& pmem, uintptr_t offset) const;
-
-  void debug_map(const ZPhysicalMemory& pmem, uintptr_t offset) const;
-  void debug_unmap(const ZPhysicalMemory& pmem, uintptr_t offset) const;
+  void map(zaddress_unsafe addr, size_t size, zoffset offset) const;
+  void unmap(zaddress_unsafe addr, size_t size) const;
 };
 
 #endif // OS_LINUX_GC_Z_ZPHYSICALMEMORYBACKING_LINUX_HPP

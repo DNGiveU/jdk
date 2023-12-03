@@ -48,8 +48,17 @@ public class TestSecurityPropertyModificationEvent {
     static String keyValue = "shouldBecomeAnEvent";
 
     public static void main(String[] args) throws Exception {
+
+        // If events in java.base are used before JFR is initialized
+        // the event handler field will be of type java.lang.Object.
+        // Adding this for one of the security events makes sure
+        // we have test coverage of this mode as well.
+        for (String key : keys) {
+            Security.setProperty(key, keyValue);
+        }
+
         try (Recording recording = new Recording()) {
-            recording.enable(EventNames.SecurityProperty);
+            recording.enable(EventNames.SecurityProperty).withStackTrace();
             recording.start();
             for (String key: keys) {
                 Security.setProperty(key, keyValue);
@@ -69,6 +78,7 @@ public class TestSecurityPropertyModificationEvent {
             if (keys.contains(e.getString("key"))) {
                 Events.assertField(e, "value").equal(keyValue);
                 i++;
+                Events.assertTopFrame(e, TestSecurityPropertyModificationEvent.class, "main");
             } else {
                 System.out.println(events);
                 throw new Exception("Unexpected event at index:" + i);

@@ -24,7 +24,6 @@ package com.sun.org.apache.bcel.internal.util;
 /**
  * Used for BCEL comparison strategy
  *
- * @version $Id$
  * @since 5.2
  */
 public interface BCELComparator {
@@ -36,8 +35,7 @@ public interface BCELComparator {
      * @param THAT
      * @return true if and only if THIS equals THAT
      */
-    boolean equals( Object THIS, Object THAT );
-
+    boolean equals(Object THIS, Object THAT);
 
     /**
      * Return hashcode for THIS.hashCode()
@@ -45,5 +43,5 @@ public interface BCELComparator {
      * @param THIS
      * @return hashcode for THIS.hashCode()
      */
-    int hashCode( Object THIS );
+    int hashCode(Object THIS);
 }

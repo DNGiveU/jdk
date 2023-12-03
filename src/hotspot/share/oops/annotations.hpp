@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2012, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2012, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -33,7 +33,6 @@
 
 class ClassLoaderData;
 class outputStream;
-class KlassSizeStats;
 
 typedef Array<u1> AnnotationArray;
 
@@ -42,6 +41,7 @@ typedef Array<u1> AnnotationArray;
 // a type_annotation instance.
 
 class Annotations: public MetaspaceObj {
+ friend class VMStructs;
  friend class JVMCIVMStructs;
 
   // If you add a new field that points to any metaspace object, you
@@ -70,15 +70,11 @@ class Annotations: public MetaspaceObj {
   // Annotations should be stored in the read-only region of CDS archive.
   static bool is_read_only_by_default() { return true; }
 
-#if INCLUDE_SERVICES
-  void collect_statistics(KlassSizeStats *sz) const;
-#endif
-
   // Constructor to initialize to null
-  Annotations() : _class_annotations(NULL),
-                  _fields_annotations(NULL),
-                  _class_type_annotations(NULL),
-                  _fields_type_annotations(NULL) {}
+  Annotations() : _class_annotations(nullptr),
+                  _fields_annotations(nullptr),
+                  _class_type_annotations(nullptr),
+                  _fields_type_annotations(nullptr) {}
 
   AnnotationArray* class_annotations() const                       { return _class_annotations; }
   Array<AnnotationArray*>* fields_annotations() const              { return _fields_annotations; }

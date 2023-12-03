@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1997, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1997, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,6 +25,7 @@
 
 package java.util.jar;
 
+import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.util.Collection;
@@ -34,11 +35,11 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
-import jdk.internal.misc.VM;
+import jdk.internal.misc.CDS;
 import jdk.internal.vm.annotation.Stable;
-import sun.util.logging.PlatformLogger;
 
-import static java.nio.charset.StandardCharsets.UTF_8;
+import sun.nio.cs.UTF_8;
+import sun.util.logging.PlatformLogger;
 
 /**
  * The Attributes class maps Manifest attribute names to associated string
@@ -54,6 +55,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  * <p>This map and its views have a predictable iteration order, namely the
  * order that keys were inserted into the map, as with {@link LinkedHashMap}.
  *
+ * @spec jar/jar.html JAR File Specification
  * @author  David Connelly
  * @see     Manifest
  * @since   1.2
@@ -68,7 +70,7 @@ public class Attributes implements Map<Object,Object>, Cloneable {
      * Constructs a new, empty Attributes object with default size.
      */
     public Attributes() {
-        this(11);
+        this(16);
     }
 
     /**
@@ -78,7 +80,7 @@ public class Attributes implements Map<Object,Object>, Cloneable {
      * @param size the initial number of attributes
      */
     public Attributes(int size) {
-        map = new LinkedHashMap<>(size);
+        map = LinkedHashMap.newLinkedHashMap(size);
     }
 
     /**
@@ -337,7 +339,7 @@ public class Attributes implements Map<Object,Object>, Cloneable {
             buffer.append(vername);
             buffer.append(": ");
             buffer.append(version);
-            out.write(buffer.toString().getBytes(UTF_8));
+            out.write(buffer.toString().getBytes(UTF_8.INSTANCE));
             Manifest.println(out);
         }
 
@@ -366,7 +368,7 @@ public class Attributes implements Map<Object,Object>, Cloneable {
 
     int read(Manifest.FastInputStream is, byte[] lbuf, String filename, int lineNumber) throws IOException {
         String name = null, value;
-        byte[] lastline = null;
+        ByteArrayOutputStream fullLine = new ByteArrayOutputStream();
 
         int len;
         while ((len = is.readLine(lbuf)) != -1) {
@@ -392,15 +394,12 @@ public class Attributes implements Map<Object,Object>, Cloneable {
                                 + Manifest.getErrorPosition(filename, lineNumber) + ")");
                 }
                 lineContinued = true;
-                byte[] buf = new byte[lastline.length + len - 1];
-                System.arraycopy(lastline, 0, buf, 0, lastline.length);
-                System.arraycopy(lbuf, 1, buf, lastline.length, len - 1);
+                fullLine.write(lbuf, 1, len - 1);
                 if (is.peek() == ' ') {
-                    lastline = buf;
                     continue;
                 }
-                value = new String(buf, 0, buf.length, UTF_8);
-                lastline = null;
+                value = fullLine.toString(UTF_8.INSTANCE);
+                fullLine.reset();
             } else {
                 while (lbuf[i++] != ':') {
                     if (i >= len) {
@@ -412,13 +411,13 @@ public class Attributes implements Map<Object,Object>, Cloneable {
                     throw new IOException("invalid header field ("
                                 + Manifest.getErrorPosition(filename, lineNumber) + ")");
                 }
-                name = new String(lbuf, 0, i - 2, UTF_8);
+                name = new String(lbuf, 0, i - 2, UTF_8.INSTANCE);
                 if (is.peek() == ' ') {
-                    lastline = new byte[len - i];
-                    System.arraycopy(lbuf, i, lastline, 0, len - i);
+                    fullLine.reset();
+                    fullLine.write(lbuf, i, len - i);
                     continue;
                 }
-                value = new String(lbuf, i, len - i, UTF_8);
+                value = new String(lbuf, i, len - i, UTF_8.INSTANCE);
             }
             try {
                 if ((putValue(name, value) != null) && (!lineContinued)) {
@@ -448,6 +447,8 @@ public class Attributes implements Map<Object,Object>, Cloneable {
      * and will be UTF8-encoded when written to the output stream.  See the
      * <a href="{@docRoot}/../specs/jar/jar.html">JAR File Specification</a>
      * for more information about valid attribute names and values.
+     *
+     * @spec jar/jar.html JAR File Specification
      */
     public static class Name {
         private final String name;
@@ -514,12 +515,8 @@ public class Attributes implements Map<Object,Object>, Cloneable {
             if (this == o) {
                 return true;
             }
-            if (o instanceof Name) {
-                Name other = (Name)o;
-                return other.name.equalsIgnoreCase(name);
-            } else {
-                return false;
-            }
+            return o instanceof Name other
+                    && other.name.equalsIgnoreCase(name);
         }
 
         /**
@@ -591,7 +588,7 @@ public class Attributes implements Map<Object,Object>, Cloneable {
         public static final Name EXTENSION_LIST;
 
         /**
-         * {@code Name} object for {@code Extension-Name} manifest attribute.
+         * {@code Name} object for {@code Extension-Name} manifest attribute
          * used for the extension mechanism that is no longer supported.
          */
         public static final Name EXTENSION_NAME;
@@ -672,7 +669,7 @@ public class Attributes implements Map<Object,Object>, Cloneable {
 
         static {
 
-            VM.initializeFromArchive(Attributes.Name.class);
+            CDS.initializeFromArchive(Attributes.Name.class);
 
             if (KNOWN_NAMES == null) {
                 MANIFEST_VERSION = new Name("Manifest-Version");
@@ -718,9 +715,10 @@ public class Attributes implements Map<Object,Object>, Cloneable {
                 // small footprint cost, but is likely to be quickly paid for by
                 // reducing allocation when reading and parsing typical manifests
 
-                // JDK internal attributes
+                // JDK specific attributes
                 addName(names, new Name("Add-Exports"));
                 addName(names, new Name("Add-Opens"));
+                addName(names, new Name("Enable-Native-Access"));
                 // LauncherHelper attributes
                 addName(names, new Name("Launcher-Agent-Class"));
                 addName(names, new Name("JavaFX-Application-Class"));

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2015, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2015, 2021, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -245,20 +245,23 @@ class AuthenticationFilter implements HeaderFilter {
         HttpHeaders hdrs = r.headers();
         HttpRequestImpl req = r.request();
 
-        if (status != UNAUTHORIZED && status != PROXY_UNAUTHORIZED) {
-            // check if any authentication succeeded for first time
-            if (exchange.serverauth != null && !exchange.serverauth.fromcache) {
-                AuthInfo au = exchange.serverauth;
-                cache.store(au.scheme, req.uri(), false, au.credentials, au.isUTF8);
-            }
+        if (status != PROXY_UNAUTHORIZED) {
             if (exchange.proxyauth != null && !exchange.proxyauth.fromcache) {
                 AuthInfo au = exchange.proxyauth;
                 URI proxyURI = getProxyURI(req);
                 if (proxyURI != null) {
+                    exchange.proxyauth = null;
                     cache.store(au.scheme, proxyURI, true, au.credentials, au.isUTF8);
                 }
             }
-            return null;
+            if (status != UNAUTHORIZED) {
+                // check if any authentication succeeded for first time
+                if (exchange.serverauth != null && !exchange.serverauth.fromcache) {
+                    AuthInfo au = exchange.serverauth;
+                    cache.store(au.scheme, req.uri(), false, au.credentials, au.isUTF8);
+                }
+                return null;
+            }
         }
 
         boolean proxy = status == PROXY_UNAUTHORIZED;
@@ -272,7 +275,7 @@ class AuthenticationFilter implements HeaderFilter {
         for (String aval : authvals) {
             HeaderParser parser = new HeaderParser(aval);
             String scheme = parser.findKey(0);
-            if (scheme.equalsIgnoreCase("Basic")) {
+            if (scheme != null && scheme.equalsIgnoreCase("Basic")) {
                 authval = aval;
                 var charset = parser.findValue("charset");
                 isUTF8 = (charset != null && charset.equalsIgnoreCase("UTF-8"));
@@ -302,7 +305,7 @@ class AuthenticationFilter implements HeaderFilter {
         AuthInfo au = proxy ? exchange.proxyauth : exchange.serverauth;
         if (au == null) {
             // if no authenticator, let the user deal with 407/401
-            if (!exchange.client().authenticator().isPresent()) return null;
+            if (exchange.client().authenticator().isEmpty()) return null;
 
             PasswordAuthentication pw = getCredentials(authval, proxy, req);
             if (pw == null) {
@@ -320,7 +323,7 @@ class AuthenticationFilter implements HeaderFilter {
             return req;
         } else if (au.retries > retry_limit) {
             throw new IOException("too many authentication attempts. Limit: " +
-                    Integer.toString(retry_limit));
+                    retry_limit);
         } else {
             // we sent credentials, but they were rejected
             if (au.fromcache) {
@@ -328,7 +331,7 @@ class AuthenticationFilter implements HeaderFilter {
             }
 
             // if no authenticator, let the user deal with 407/401
-            if (!exchange.client().authenticator().isPresent()) return null;
+            if (exchange.client().authenticator().isEmpty()) return null;
 
             // try again
             PasswordAuthentication pw = getCredentials(authval, proxy, req);

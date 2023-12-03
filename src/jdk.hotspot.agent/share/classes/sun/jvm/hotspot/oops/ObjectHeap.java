@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2000, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2000, 2022, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -37,7 +37,7 @@ import sun.jvm.hotspot.gc.epsilon.*;
 import sun.jvm.hotspot.gc.g1.*;
 import sun.jvm.hotspot.gc.shenandoah.*;
 import sun.jvm.hotspot.gc.parallel.*;
-import sun.jvm.hotspot.gc.z.*;
+import sun.jvm.hotspot.gc.x.*;
 import sun.jvm.hotspot.memory.*;
 import sun.jvm.hotspot.runtime.*;
 import sun.jvm.hotspot.types.*;
@@ -53,15 +53,15 @@ public class ObjectHeap {
 
   public ObjectHeap(TypeDataBase db) throws WrongTypeException {
     // Get commonly used sizes of basic types
-    oopSize     = VM.getVM().getOopSize();
-    byteSize    = db.getJByteType().getSize();
-    charSize    = db.getJCharType().getSize();
-    booleanSize = db.getJBooleanType().getSize();
-    intSize     = db.getJIntType().getSize();
-    shortSize   = db.getJShortType().getSize();
-    longSize    = db.getJLongType().getSize();
-    floatSize   = db.getJFloatType().getSize();
-    doubleSize  = db.getJDoubleType().getSize();
+    oopSize     = (int) VM.getVM().getOopSize();
+    byteSize    = (int) db.getJByteType().getSize();
+    charSize    = (int) db.getJCharType().getSize();
+    booleanSize = (int) db.getJBooleanType().getSize();
+    intSize     = (int) db.getJIntType().getSize();
+    shortSize   = (int) db.getJShortType().getSize();
+    longSize    = (int) db.getJLongType().getSize();
+    floatSize   = (int) db.getJFloatType().getSize();
+    doubleSize  = (int) db.getJDoubleType().getSize();
   }
 
   /** Comparison operation for oops, either or both of which may be null */
@@ -71,25 +71,25 @@ public class ObjectHeap {
   }
 
   // Cached sizes of basic types
-  private long oopSize;
-  private long byteSize;
-  private long charSize;
-  private long booleanSize;
-  private long intSize;
-  private long shortSize;
-  private long longSize;
-  private long floatSize;
-  private long doubleSize;
+  private final int oopSize;
+  private final int byteSize;
+  private final int charSize;
+  private final int booleanSize;
+  private final int intSize;
+  private final int shortSize;
+  private final int longSize;
+  private final int floatSize;
+  private final int doubleSize;
 
-  public long getOopSize()     { return oopSize;     }
-  public long getByteSize()    { return byteSize;    }
-  public long getCharSize()    { return charSize;    }
-  public long getBooleanSize() { return booleanSize; }
-  public long getIntSize()     { return intSize;     }
-  public long getShortSize()   { return shortSize;   }
-  public long getLongSize()    { return longSize;    }
-  public long getFloatSize()   { return floatSize;   }
-  public long getDoubleSize()  { return doubleSize;  }
+  public int getOopSize()     { return oopSize;     }
+  public int getByteSize()    { return byteSize;    }
+  public int getCharSize()    { return charSize;    }
+  public int getBooleanSize() { return booleanSize; }
+  public int getIntSize()     { return intSize;     }
+  public int getShortSize()   { return shortSize;   }
+  public int getLongSize()    { return longSize;    }
+  public int getFloatSize()   { return floatSize;   }
+  public int getDoubleSize()  { return doubleSize;  }
 
   /** an interface to filter objects while walking heap */
   public static interface ObjectFilter {
@@ -133,20 +133,20 @@ public class ObjectHeap {
       extremely low level (stepping word-by-word) to provide the
       ability to do very low-level debugging */
   public void iterateRaw(RawHeapVisitor visitor) {
-    List liveRegions = collectLiveRegions();
+    List<Address> liveRegions = collectLiveRegions();
 
     // Summarize size
     long totalSize = 0;
     for (int i = 0; i < liveRegions.size(); i += 2) {
-      Address bottom = (Address) liveRegions.get(i);
-      Address top    = (Address) liveRegions.get(i+1);
+      Address bottom = liveRegions.get(i);
+      Address top    = liveRegions.get(i+1);
       totalSize += top.minus(bottom);
     }
     visitor.prologue(totalSize);
 
     for (int i = 0; i < liveRegions.size(); i += 2) {
-      Address bottom = (Address) liveRegions.get(i);
-      Address top    = (Address) liveRegions.get(i+1);
+      Address bottom = liveRegions.get(i);
+      Address top    = liveRegions.get(i+1);
 
       // Traverses the space from bottom to top
       while (bottom.lessThan(top)) {
@@ -190,7 +190,7 @@ public class ObjectHeap {
       System.err.println("Oop's klass is " + klass);
     }
 
-    throw new UnknownOopException();
+    throw new UnknownOopException(handle.toString());
   }
 
   // Print all objects in the object heap
@@ -223,26 +223,19 @@ public class ObjectHeap {
         });
   }
 
-  private void iterateLiveRegions(List liveRegions, HeapVisitor visitor, ObjectFilter of) {
+  private void iterateLiveRegions(List<Address> liveRegions, HeapVisitor visitor, ObjectFilter of) {
     // Summarize size
     long totalSize = 0;
     for (int i = 0; i < liveRegions.size(); i += 2) {
-      Address bottom = (Address) liveRegions.get(i);
-      Address top    = (Address) liveRegions.get(i+1);
+      Address bottom = liveRegions.get(i);
+      Address top    = liveRegions.get(i+1);
       totalSize += top.minus(bottom);
     }
     visitor.prologue(totalSize);
 
-    CollectedHeap heap = VM.getVM().getUniverse().heap();
-
-    if (heap instanceof GenCollectedHeap) {
-      GenCollectedHeap genHeap = (GenCollectedHeap) heap;
-      Generation genOld = genHeap.getGen(1);
-    }
-
     for (int i = 0; i < liveRegions.size(); i += 2) {
-      Address bottom = (Address) liveRegions.get(i);
-      Address top    = (Address) liveRegions.get(i+1);
+      Address bottom = liveRegions.get(i);
+      Address top    = liveRegions.get(i+1);
 
       try {
         // Traverses the space from bottom to top
@@ -251,13 +244,7 @@ public class ObjectHeap {
         while (handle.lessThan(top)) {
           Oop obj = null;
 
-          try {
-            obj = newOop(handle);
-          } catch (UnknownOopException exp) {
-            if (DEBUG) {
-              throw new RuntimeException(" UnknownOopException  " + exp);
-            }
-          }
+          obj = newOop(handle);
           if (obj == null) {
               throw new UnknownOopException();
           }
@@ -270,11 +257,7 @@ public class ObjectHeap {
 
           handle = handle.addOffsetToAsOopHandle(obj.getObjectSize());
         }
-      }
-      catch (AddressException e) {
-        // This is okay at the top of these regions
-          }
-      catch (UnknownOopException e) {
+      } catch (AddressException | UnknownOopException | WrongTypeException e) {
         // This is okay at the top of these regions
       }
     }
@@ -372,8 +355,8 @@ public class ObjectHeap {
     if (DEBUG) {
       System.err.println("liveRegions:");
       for (int i = 0; i < liveRegions.size(); i += 2) {
-          Address bottom = (Address) liveRegions.get(i);
-          Address top    = (Address) liveRegions.get(i+1);
+          Address bottom = liveRegions.get(i);
+          Address top    = liveRegions.get(i+1);
           System.err.println(" " + bottom + " - " + top);
       }
     }
@@ -382,7 +365,7 @@ public class ObjectHeap {
   }
 
   private void sortLiveRegions(List<Address> liveRegions) {
-    Collections.sort(liveRegions, new Comparator<Address>() {
+    liveRegions.sort(new Comparator<Address>() {
         public int compare(Address a1, Address a2) {
           if (AddressOps.lt(a1, a2)) {
             return -1;

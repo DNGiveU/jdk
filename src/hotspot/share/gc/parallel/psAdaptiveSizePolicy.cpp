@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2002, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2002, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,7 +28,7 @@
 #include "gc/parallel/psGCAdaptivePolicyCounters.hpp"
 #include "gc/parallel/psScavenge.hpp"
 #include "gc/shared/gcCause.hpp"
-#include "gc/shared/gcUtil.inline.hpp"
+#include "gc/shared/gcUtil.hpp"
 #include "gc/shared/gcPolicyCounters.hpp"
 #include "logging/log.hpp"
 #include "runtime/timer.hpp"
@@ -60,10 +60,8 @@ PSAdaptiveSizePolicy::PSAdaptiveSizePolicy(size_t init_eden_size,
      _live_at_last_full_gc(init_promo_size),
      _change_old_gen_for_min_pauses(0),
      _change_young_gen_for_maj_pauses(0),
-     _old_gen_policy_is_ready(false),
      _young_gen_size_increment_supplement(YoungGenerationSizeSupplement),
-     _old_gen_size_increment_supplement(TenuredGenerationSizeSupplement),
-     _bytes_absorbed_from_eden(0)
+     _old_gen_size_increment_supplement(TenuredGenerationSizeSupplement)
 {
   // Start the timers
   _major_timer.start();
@@ -165,32 +163,10 @@ void PSAdaptiveSizePolicy::major_collection_end(size_t amount_live,
   // Update the amount live at the end of a full GC
   _live_at_last_full_gc = amount_live;
 
-  // The policy does not have enough data until at least some major collections
-  // have been done.
-  if (_avg_major_pause->count() >= AdaptiveSizePolicyReadyThreshold) {
-    _old_gen_policy_is_ready = true;
-  }
-
   // Interval times use this timer to measure the interval that
   // the mutator runs.  Reset after the GC pause has been measured.
   _major_timer.reset();
   _major_timer.start();
-}
-
-// If the remaining free space in the old generation is less that
-// that expected to be needed by the next collection, do a full
-// collection now.
-bool PSAdaptiveSizePolicy::should_full_GC(size_t old_free_in_bytes) {
-
-  // A similar test is done in the scavenge's should_attempt_scavenge().  If
-  // this is changed, decide if that test should also be changed.
-  bool result = padded_average_promoted_in_bytes() > (float) old_free_in_bytes;
-  log_trace(gc, ergo)("%s after scavenge average_promoted " SIZE_FORMAT " padded_average_promoted " SIZE_FORMAT " free in old gen " SIZE_FORMAT,
-                      result ? "Full" : "No full",
-                      (size_t) average_promoted_in_bytes(),
-                      (size_t) padded_average_promoted_in_bytes(),
-                      old_free_in_bytes);
-  return result;
 }
 
 void PSAdaptiveSizePolicy::clear_generation_free_space_flags() {
@@ -357,7 +333,7 @@ void PSAdaptiveSizePolicy::compute_eden_space_size(
     log_debug(gc, ergo)(
           "PSAdaptiveSizePolicy::compute_eden_space_size: gc time limit"
           " gc_cost: %f "
-          " GCTimeLimit: " UINTX_FORMAT,
+          " GCTimeLimit: %u",
           gc_cost(), GCTimeLimit);
   }
 
@@ -534,7 +510,7 @@ void PSAdaptiveSizePolicy::compute_old_gen_free_space(
     log_debug(gc, ergo)(
           "PSAdaptiveSizePolicy::compute_old_gen_free_space: gc time limit"
           " gc_cost: %f "
-          " GCTimeLimit: " UINTX_FORMAT,
+          " GCTimeLimit: %u",
           gc_cost(), GCTimeLimit);
   }
 
@@ -915,16 +891,6 @@ size_t PSAdaptiveSizePolicy::eden_increment(size_t cur_eden) {
   return eden_increment(cur_eden, YoungGenerationSizeIncrement);
 }
 
-size_t PSAdaptiveSizePolicy::eden_increment_aligned_up(size_t cur_eden) {
-  size_t result = eden_increment(cur_eden, YoungGenerationSizeIncrement);
-  return align_up(result, _space_alignment);
-}
-
-size_t PSAdaptiveSizePolicy::eden_increment_aligned_down(size_t cur_eden) {
-  size_t result = eden_increment(cur_eden);
-  return align_down(result, _space_alignment);
-}
-
 size_t PSAdaptiveSizePolicy::eden_increment_with_supplement_aligned_up(
   size_t cur_eden) {
   size_t result = eden_increment(cur_eden,
@@ -952,16 +918,6 @@ size_t PSAdaptiveSizePolicy::promo_increment(size_t cur_promo,
 
 size_t PSAdaptiveSizePolicy::promo_increment(size_t cur_promo) {
   return promo_increment(cur_promo, TenuredGenerationSizeIncrement);
-}
-
-size_t PSAdaptiveSizePolicy::promo_increment_aligned_up(size_t cur_promo) {
-  size_t result =  promo_increment(cur_promo, TenuredGenerationSizeIncrement);
-  return align_up(result, _space_alignment);
-}
-
-size_t PSAdaptiveSizePolicy::promo_increment_aligned_down(size_t cur_promo) {
-  size_t result =  promo_increment(cur_promo, TenuredGenerationSizeIncrement);
-  return align_down(result, _space_alignment);
 }
 
 size_t PSAdaptiveSizePolicy::promo_increment_with_supplement_aligned_up(

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -23,7 +23,7 @@
 
 /**
  * @test
- * @bug 8196433
+ * @bug 8196433 8307168
  * @summary use the new error diagnostic approach at javac.Main
  * @library /tools/lib
  * @modules jdk.compiler/com.sun.tools.javac.api
@@ -36,6 +36,9 @@
  */
 
 import java.util.Locale;
+
+import java.util.List;
+import java.util.stream.Collectors;
 
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -136,21 +139,21 @@ public class OptionSmokeTest extends TestRunner {
 
     @Test
     public void sourceAndTargetMismatch(Path base) throws Exception {
-        doTest(base, String.format("warning: source release %s requires target release %s", Source.DEFAULT.name, Source.DEFAULT.name),
+        doTest(base, String.format("error: specified target release %s is too old for the specified source release %s", Source.MIN.name, Source.DEFAULT.name),
                 String.format("-source %s -target %s", Source.DEFAULT.name, Source.MIN.name));
     }
 
     @Test
     public void targetConflictsWithDefaultSource(Path base) throws Exception {
-        doTest(base, String.format("warning: target release %s conflicts with default source release %s", Source.MIN.name, Source.DEFAULT.name),
+        doTest(base, String.format("error: specified target release %s is too old for the default source release %s", Source.MIN.name, Source.DEFAULT.name),
                 String.format("-target %s", Source.MIN.name));
     }
 
-    @Test
-    public void profileNotValidForTarget(Path base) throws Exception {
-        doTest(base, String.format("warning: profile compact2 is not valid for target release %s", Source.MIN.name),
-                String.format("-profile compact2 -target %s -source %s", Source.MIN.name, Source.MIN.name));
-    }
+//     @Test
+//     public void profileNotValidForTarget(Path base) throws Exception {
+//         doTest(base, String.format("warning: profile compact2 is not valid for target release %s", Source.MIN.name),
+//                 String.format("-profile compact2 -target %s -source %s", Source.MIN.name, Source.MIN.name));
+//     }
 
     @Test
     public void fileNotFound(Path base) throws Exception {
@@ -200,14 +203,21 @@ public class OptionSmokeTest extends TestRunner {
     public void unmatchedQuoteInEnvVar(Path base) throws Exception {
         Path src = base.resolve("src");
         tb.writeJavaFiles(src, "class Dummy {}");
-        String log = new JavacTask(tb, Task.Mode.EXEC)
+        List<String> log = new JavacTask(tb, Task.Mode.EXEC)
                 .envVar("JDK_JAVAC_OPTIONS",
                         String.format("--add-exports jdk.compiler%scom.sun.tools.javac.jvm=\"ALL-UNNAMED", fileSeparator))
+                .options("-J-Duser.language=en", "-J-Duser.country=US")
                 .files(findJavaFiles(src))
                 .run(Task.Expect.FAIL)
                 .writeAll()
-                .getOutput(Task.OutputKind.STDERR);
-        Assert.check(log.startsWith("error: unmatched quote in environment variable JDK_JAVAC_OPTIONS"));
+                .getOutputLines(Task.OutputKind.STDERR);
+        log = log.stream().filter(s->!s.matches("^Picked up .*JAVA.*OPTIONS:.*")).collect(Collectors.toList());
+        List<String> expected = List.of(
+                "error: unmatched quote in environment variable JDK_JAVAC_OPTIONS",
+                "Usage: javac <options> <source files>",
+                "use --help for a list of possible options"
+        );
+        tb.checkEqual(log, expected);
     }
 
     @Test
@@ -243,6 +253,34 @@ public class OptionSmokeTest extends TestRunner {
                 String.format("--release %s --system none", Source.DEFAULT.name));
         doTestNoSource(base, "error: option --upgrade-module-path cannot be used together with --release",
                 String.format("--release %s --upgrade-module-path any", Source.DEFAULT.name));
+    }
+
+    @Test
+    public void consistentSystemOptionHandlingWithAnEmptyDirectory(Path base) throws Exception {
+        tb.createDirectories(base);
+        doTestNoSource(base, "error: illegal argument for --system: %s".formatted(base), String.format("--system %s", base));
+    }
+
+    @Test
+    public void consistentSystemOptionHandlingWithLibJrtFsJar(Path base) throws Exception {
+        tb.createDirectories(base);
+        tb.writeFile(base.resolve("lib").resolve("jrt-fs.jar"), "this is not a JAR file");
+        doTestNoSource(base, "error: illegal argument for --system: %s".formatted(base), String.format("--system %s", base));
+    }
+
+    @Test
+    public void consistentSystemOptionHandlingWithLibModules(Path base) throws Exception {
+        tb.createDirectories(base);
+        tb.writeFile(base.resolve("lib").resolve("modules"), "this is not a modules file");
+        doTestNoSource(base, "error: illegal argument for --system: %s".formatted(base), String.format("--system %s", base));
+    }
+
+    @Test
+    public void consistentSystemOptionHandlingWithAlmostValidLibEntries(Path base) throws Exception {
+        tb.createDirectories(base);
+        tb.writeFile(base.resolve("lib").resolve("jrt-fs.jar"), "this is not a JAR file");
+        tb.writeFile(base.resolve("lib").resolve("modules"), "this is not a modules file");
+        doTestNoSource(base, "error: no source files", String.format("--system %s", base));
     }
 
     void doTest(Path base, String output, String options) throws Exception {

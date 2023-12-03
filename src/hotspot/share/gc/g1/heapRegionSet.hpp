@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2011, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2011, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -82,7 +82,7 @@ protected:
   void verify_region(HeapRegion* hr) PRODUCT_RETURN;
 
   void check_mt_safety() {
-    if (_checker != NULL) {
+    if (_checker != nullptr) {
       _checker->check_mt_safety();
     }
   }
@@ -180,12 +180,17 @@ private:
   inline void increase_length(uint node_index);
   inline void decrease_length(uint node_index);
 
+  // Common checks for adding a list.
+  void add_list_common_start(FreeRegionList* from_list);
+  void add_list_common_end(FreeRegionList* from_list);
+
+  void verify_region_to_remove(HeapRegion* curr, HeapRegion* next) NOT_DEBUG_RETURN;
 protected:
   // See the comment for HeapRegionSetBase::clear()
   virtual void clear();
 
 public:
-  FreeRegionList(const char* name, HeapRegionSetChecker* checker = NULL);
+  FreeRegionList(const char* name, HeapRegionSetChecker* checker = nullptr);
   ~FreeRegionList();
 
   void verify_list();
@@ -202,6 +207,8 @@ public:
   // Assumes that the list is ordered and will preserve that order. The order
   // is determined by hrm_index.
   inline void add_ordered(HeapRegion* hr);
+  // Same restrictions as above, but adds the region last in the list.
+  inline void add_to_tail(HeapRegion* region_to_add);
 
   // Removes from head or tail based on the given argument.
   HeapRegion* remove_region(bool from_head);
@@ -212,18 +219,21 @@ public:
   // Merge two ordered lists. The result is also ordered. The order is
   // determined by hrm_index.
   void add_ordered(FreeRegionList* from_list);
+  void append_ordered(FreeRegionList* from_list);
 
   // It empties the list by removing all regions from it.
   void remove_all();
 
+  // Abandon current free list. Requires that all regions in the current list
+  // are taken care of separately, to allow a rebuild.
+  void abandon();
+
   // Remove all (contiguous) regions from first to first + num_regions -1 from
   // this list.
-  // Num_regions must be > 1.
+  // Num_regions must be >= 1.
   void remove_starting_at(HeapRegion* first, uint num_regions);
 
   virtual void verify();
-
-  uint num_of_regions_in_range(uint start, uint end) const;
 
   using HeapRegionSetBase::length;
   uint length(uint node_index) const;
@@ -239,7 +249,7 @@ private:
 
 public:
   bool more_available() {
-    return _curr != NULL;
+    return _curr != nullptr;
   }
 
   HeapRegion* get_next() {

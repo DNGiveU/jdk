@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2014, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -28,12 +28,13 @@ package gc.g1;
  * @bug 8051973
  * @summary Test to make sure that eager reclaim of humongous objects correctly clears
  * mark bitmaps at reclaim.
- * @key gc
+ * @key randomness
  * @requires vm.gc.G1
+ * @requires vm.debug
  * @library /test/lib
  * @modules java.base/jdk.internal.misc
  *          java.management
- * @run main gc.g1.TestEagerReclaimHumongousRegionsClearMarkBits
+ * @run driver gc.g1.TestEagerReclaimHumongousRegionsClearMarkBits
  */
 
 import java.util.ArrayList;
@@ -42,6 +43,7 @@ import java.util.Random;
 
 import jdk.test.lib.process.OutputAnalyzer;
 import jdk.test.lib.process.ProcessTools;
+import jdk.test.lib.Utils;
 
 // An object that has a few references to other instances to slow down marking.
 class ObjectWithSomeRefs {
@@ -52,7 +54,7 @@ class ObjectWithSomeRefs {
 }
 
 class TestEagerReclaimHumongousRegionsClearMarkBitsReclaimRegionFast {
-    public static final long MAX_MILLIS_FOR_RUN = 50 * 1000; // The maximum runtime for the actual test.
+    public static final long MAX_NANOS_FOR_RUN = 50L * 1_000_000_000L; // The maximum runtime for the actual test.
 
     public static final int M = 1024*1024;
 
@@ -75,7 +77,7 @@ class TestEagerReclaimHumongousRegionsClearMarkBitsReclaimRegionFast {
              longList.add(new ObjectWithSomeRefs());
         }
 
-        Random rnd = new Random();
+        Random rnd = Utils.getRandomInstance();
         for (int i = 0; i < longList.size(); i++) {
              int len = longList.size();
              longList.get(i).other1 = longList.get(rnd.nextInt(len));
@@ -91,11 +93,11 @@ class TestEagerReclaimHumongousRegionsClearMarkBitsReclaimRegionFast {
 
         Object ref_from_stack = large1;
 
-        long start_millis = System.currentTimeMillis();
+        long start_nanos = System.nanoTime();
 
         for (int i = 0; i < 20; i++) {
-            long current_millis = System.currentTimeMillis();
-            if ((current_millis - start_millis) > MAX_MILLIS_FOR_RUN) {
+            long current_nanos = System.nanoTime();
+            if ((current_nanos - start_nanos) > MAX_NANOS_FOR_RUN) {
               System.out.println("Finishing test because maximum runtime exceeded");
               break;
             }
@@ -117,22 +119,20 @@ class TestEagerReclaimHumongousRegionsClearMarkBitsReclaimRegionFast {
 
 public class TestEagerReclaimHumongousRegionsClearMarkBits {
     public static void main(String[] args) throws Exception {
-        ProcessBuilder pb = ProcessTools.createJavaProcessBuilder(
+        ProcessBuilder pb = ProcessTools.createLimitedTestJavaProcessBuilder(
             "-XX:+UseG1GC",
             "-Xms128M",
             "-Xmx128M",
             "-Xmn2M",
             "-XX:G1HeapRegionSize=1M",
-            "-XX:InitiatingHeapOccupancyPercent=0", // Want to have as much as possible initial marks.
+            "-XX:InitiatingHeapOccupancyPercent=0", // Want to have as much as possible mark cycles.
             "-Xlog:gc",
             "-XX:+UnlockDiagnosticVMOptions",
             "-XX:+VerifyAfterGC",
             "-XX:ConcGCThreads=1", // Want to make marking as slow as possible.
-            "-XX:+IgnoreUnrecognizedVMOptions", // G1VerifyBitmaps is develop only.
             "-XX:+G1VerifyBitmaps",
             TestEagerReclaimHumongousRegionsClearMarkBitsReclaimRegionFast.class.getName());
         OutputAnalyzer output = new OutputAnalyzer(pb.start());
         output.shouldHaveExitValue(0);
     }
 }
-

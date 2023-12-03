@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2003, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2003, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,10 +25,14 @@
 
 package java.util;
 
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.StandardCharsets;
 import java.security.*;
 
 import jdk.internal.access.JavaLangAccess;
 import jdk.internal.access.SharedSecrets;
+import jdk.internal.util.ByteArrayLittleEndian;
+import jdk.internal.util.HexDigits;
 
 /**
  * A class that represents an immutable universally unique identifier (UUID).
@@ -68,6 +72,8 @@ import jdk.internal.access.SharedSecrets;
  * Universally Unique IDentifier (UUID) URN Namespace</i></a>, section 4.2
  * &quot;Algorithms for Creating a Time-Based UUID&quot;.
  *
+ * @spec https://www.rfc-editor.org/info/rfc4122
+ *      RFC 4122: A Universally Unique IDentifier (UUID) URN Namespace
  * @since   1.5
  */
 public final class UUID implements java.io.Serializable, Comparable<UUID> {
@@ -152,7 +158,7 @@ public final class UUID implements java.io.Serializable, Comparable<UUID> {
         randomBytes[6]  &= 0x0f;  /* clear version        */
         randomBytes[6]  |= 0x40;  /* set to version 4     */
         randomBytes[8]  &= 0x3f;  /* clear variant        */
-        randomBytes[8]  |= 0x80;  /* set to IETF variant  */
+        randomBytes[8]  |= (byte) 0x80;  /* set to IETF variant  */
         return new UUID(randomBytes);
     }
 
@@ -176,8 +182,47 @@ public final class UUID implements java.io.Serializable, Comparable<UUID> {
         md5Bytes[6]  &= 0x0f;  /* clear version        */
         md5Bytes[6]  |= 0x30;  /* set to version 3     */
         md5Bytes[8]  &= 0x3f;  /* clear variant        */
-        md5Bytes[8]  |= 0x80;  /* set to IETF variant  */
+        md5Bytes[8]  |= (byte) 0x80;  /* set to IETF variant  */
         return new UUID(md5Bytes);
+    }
+
+    private static final byte[] NIBBLES;
+    static {
+        byte[] ns = new byte[256];
+        Arrays.fill(ns, (byte) -1);
+        ns['0'] = 0;
+        ns['1'] = 1;
+        ns['2'] = 2;
+        ns['3'] = 3;
+        ns['4'] = 4;
+        ns['5'] = 5;
+        ns['6'] = 6;
+        ns['7'] = 7;
+        ns['8'] = 8;
+        ns['9'] = 9;
+        ns['A'] = 10;
+        ns['B'] = 11;
+        ns['C'] = 12;
+        ns['D'] = 13;
+        ns['E'] = 14;
+        ns['F'] = 15;
+        ns['a'] = 10;
+        ns['b'] = 11;
+        ns['c'] = 12;
+        ns['d'] = 13;
+        ns['e'] = 14;
+        ns['f'] = 15;
+        NIBBLES = ns;
+    }
+
+    private static long parse4Nibbles(String name, int pos) {
+        byte[] ns = NIBBLES;
+        char ch1 = name.charAt(pos);
+        char ch2 = name.charAt(pos + 1);
+        char ch3 = name.charAt(pos + 2);
+        char ch4 = name.charAt(pos + 3);
+        return (ch1 | ch2 | ch3 | ch4) > 0xff ?
+                -1 : ns[ch1] << 12 | ns[ch2] << 8 | ns[ch3] << 4 | ns[ch4];
     }
 
     /**
@@ -195,12 +240,37 @@ public final class UUID implements java.io.Serializable, Comparable<UUID> {
      *
      */
     public static UUID fromString(String name) {
+        if (name.length() == 36) {
+            char ch1 = name.charAt(8);
+            char ch2 = name.charAt(13);
+            char ch3 = name.charAt(18);
+            char ch4 = name.charAt(23);
+            if (ch1 == '-' && ch2 == '-' && ch3 == '-' && ch4 == '-') {
+                long msb1 = parse4Nibbles(name, 0);
+                long msb2 = parse4Nibbles(name, 4);
+                long msb3 = parse4Nibbles(name, 9);
+                long msb4 = parse4Nibbles(name, 14);
+                long lsb1 = parse4Nibbles(name, 19);
+                long lsb2 = parse4Nibbles(name, 24);
+                long lsb3 = parse4Nibbles(name, 28);
+                long lsb4 = parse4Nibbles(name, 32);
+                if ((msb1 | msb2 | msb3 | msb4 | lsb1 | lsb2 | lsb3 | lsb4) >= 0) {
+                    return new UUID(
+                            msb1 << 48 | msb2 << 32 | msb3 << 16 | msb4,
+                            lsb1 << 48 | lsb2 << 32 | lsb3 << 16 | lsb4);
+                }
+            }
+        }
+        return fromString1(name);
+    }
+
+    private static UUID fromString1(String name) {
         int len = name.length();
         if (len > 36) {
             throw new IllegalArgumentException("UUID string too large");
         }
 
-        int dash1 = name.indexOf('-', 0);
+        int dash1 = name.indexOf('-');
         int dash2 = name.indexOf('-', dash1 + 1);
         int dash3 = name.indexOf('-', dash2 + 1);
         int dash4 = name.indexOf('-', dash3 + 1);
@@ -281,6 +351,9 @@ public final class UUID implements java.io.Serializable, Comparable<UUID> {
      * </ul>
      *
      * @return  The variant number of this {@code UUID}
+     *
+     * @spec https://www.rfc-editor.org/info/rfc4122
+     *      RFC 4122: A Universally Unique IDentifier (UUID) URN Namespace
      */
     public int variant() {
         // This field is composed of a varying number of bits.
@@ -392,8 +465,45 @@ public final class UUID implements java.io.Serializable, Comparable<UUID> {
      *
      * @return  A string representation of this {@code UUID}
      */
+    @Override
     public String toString() {
-        return jla.fastUUID(leastSigBits, mostSigBits);
+        long lsb = leastSigBits;
+        long msb = mostSigBits;
+        byte[] buf = new byte[36];
+        ByteArrayLittleEndian.setLong(
+                buf,
+                0,
+                HexDigits.packDigits((int) (msb >> 56), (int) (msb >> 48), (int) (msb >> 40), (int) (msb >> 32)));
+        buf[8] = '-';
+        ByteArrayLittleEndian.setInt(
+                buf,
+                9,
+                HexDigits.packDigits(((int) msb) >> 24, ((int) msb) >> 16));
+        buf[13] = '-';
+        ByteArrayLittleEndian.setInt(
+                buf,
+                14,
+                HexDigits.packDigits(((int) msb) >> 8, (int) msb));
+        buf[18] = '-';
+        ByteArrayLittleEndian.setInt(
+                buf,
+                19,
+                HexDigits.packDigits((int) (lsb >> 56), (int) (lsb >> 48)));
+        buf[23] = '-';
+        ByteArrayLittleEndian.setLong(
+                buf,
+                24,
+                HexDigits.packDigits((int) (lsb >> 40), (int) (lsb >> 32), ((int) lsb) >> 24, ((int) lsb) >> 16));
+        ByteArrayLittleEndian.setInt(
+                buf,
+                32,
+                HexDigits.packDigits(((int) lsb) >> 8, (int) lsb));
+
+        try {
+            return jla.newStringNoRepl(buf, StandardCharsets.ISO_8859_1);
+        } catch (CharacterCodingException cce) {
+            throw new AssertionError(cce);
+        }
     }
 
     /**
@@ -401,9 +511,9 @@ public final class UUID implements java.io.Serializable, Comparable<UUID> {
      *
      * @return  A hash code value for this {@code UUID}
      */
+    @Override
     public int hashCode() {
-        long hilo = mostSigBits ^ leastSigBits;
-        return ((int)(hilo >> 32)) ^ (int) hilo;
+        return Long.hashCode(mostSigBits ^ leastSigBits);
     }
 
     /**
@@ -418,6 +528,7 @@ public final class UUID implements java.io.Serializable, Comparable<UUID> {
      * @return  {@code true} if the objects are the same; {@code false}
      *          otherwise
      */
+    @Override
     public boolean equals(Object obj) {
         if ((null == obj) || (obj.getClass() != UUID.class))
             return false;
@@ -442,13 +553,11 @@ public final class UUID implements java.io.Serializable, Comparable<UUID> {
      *          greater than {@code val}
      *
      */
+    @Override
     public int compareTo(UUID val) {
         // The ordering is intentionally set up so that the UUIDs
         // can simply be numerically compared as two numbers
-        return (this.mostSigBits < val.mostSigBits ? -1 :
-                (this.mostSigBits > val.mostSigBits ? 1 :
-                 (this.leastSigBits < val.leastSigBits ? -1 :
-                  (this.leastSigBits > val.leastSigBits ? 1 :
-                   0))));
+        int mostSigBits = Long.compare(this.mostSigBits, val.mostSigBits);
+        return mostSigBits != 0 ? mostSigBits : Long.compare(this.leastSigBits, val.leastSigBits);
     }
 }

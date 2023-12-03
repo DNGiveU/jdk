@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2007, 2019, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2007, 2020, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -61,7 +61,7 @@ import java.util.concurrent.TimeUnit;
  * are {@link Thread#isDaemon daemon} threads.
  *
  * <table class="striped">
- * <caption style="display:none:">System properties</caption>
+ * <caption style="display:none">System properties</caption>
  *   <thead>
  *   <tr>
  *     <th scope="col">System property</th>
@@ -332,7 +332,7 @@ public abstract class AsynchronousChannelGroup {
 
     /**
      * Awaits termination of the group.
-
+     *
      * <p> This method blocks until the group has terminated, or the timeout
      * occurs, or the current thread is interrupted, whichever happens first.
      *

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1998, 2017, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1998, 2023, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -114,7 +114,7 @@ public interface ObjectReference extends Value {
      * Sets the value of a given instance or static field in this object.
      * The {@link Field} must be valid for this ObjectReference; that is,
      * it must be from the mirrored object's class or a superclass of that class.
-     * If static, the field must not be final.
+     * The field must not be final.
      * <p>
      * Object values must be assignment compatible with the field type
      * (This implies that the field type must be loaded through the
@@ -122,14 +122,14 @@ public interface ObjectReference extends Value {
      * either assignment compatible with the field type or must be
      * convertible to the field type without loss of information.
      * See section 5.2 of
-     * <cite>The Java&trade; Language Specification</cite>
+     * <cite>The Java Language Specification</cite>
      * for more information on assignment
      * compatibility.
      *
      * @param field the field containing the requested value
      * @param value the new value to assign
      * @throws java.lang.IllegalArgumentException if the field is not valid for
-     * this object's class.
+     * this object's class or the field is final.
      * @throws InvalidTypeException if the value's type does not match
      * the field's type.
      * @throws ClassNotLoadedException if 'value' is not null, and the field
@@ -184,12 +184,12 @@ public interface ObjectReference extends Value {
      * Autoboxing is not supported.
      *
      * See section 5.2 of
-     * <cite>The Java&trade; Language Specification</cite>
+     * <cite>The Java Language Specification</cite>
      * for more information on assignment compatibility.
      * <p>
      * By default, the method is invoked using dynamic lookup as
      * documented in section 15.12.4.4 of
-     * <cite>The Java&trade; Language Specification</cite>
+     * <cite>The Java Language Specification</cite>
      * in particular, overriding based on the runtime type of the object
      * mirrored by this {@link ObjectReference} will occur. This
      * behavior can be changed by specifying the
@@ -205,7 +205,7 @@ public interface ObjectReference extends Value {
      * the method is being invoked if they were previously
      * suspended by an event or by {@link VirtualMachine#suspend} or
      * {@link ThreadReference#suspend}. This is done to prevent the deadlocks
-     * that will occur if any of the threads own monitors
+     * that will occur if any of the threads own resources, such as monitors,
      * that will be needed by the invoked method.
      * Note, however, that this implicit resume acts exactly like
      * {@link ThreadReference#resume}, so if the thread's suspend
@@ -238,6 +238,15 @@ public interface ObjectReference extends Value {
      * <p>
      * If the target VM is disconnected during the invoke (for example, through
      * {@link VirtualMachine#dispose}) the method invocation continues.
+     *
+     * @apiNote
+     * <a href="{@docRoot}/java.base/java/lang/Thread.html#virtual-threads">Virtual threads</a>
+     * are typically user-mode threads scheduled by the Java runtime rather than
+     * the operating system. As such, there may be more cases with virtual threads
+     * where the {@link #INVOKE_SINGLE_THREADED} option may cause a deadlock.
+     * For example, suspending all threads in the target VM may suspend threads that
+     * support the timer mechanism for virtual threads, and thus methods such as
+     * {@link Thread#sleep} may deadlock.
      *
      * @param thread the thread in which to invoke.
      * @param method the {@link Method} to invoke.

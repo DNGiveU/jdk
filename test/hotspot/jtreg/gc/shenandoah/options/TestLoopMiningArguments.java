@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2017, 2019, Red Hat, Inc. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License version 2 only, as
@@ -22,10 +23,9 @@
  */
 
 /*
- * @test TestLoopMiningArguments
+ * @test
  * @summary Test that loop mining arguments are sane
- * @key gc
- * @requires vm.gc.Shenandoah & !vm.graal.enabled
+ * @requires vm.gc.Shenandoah
  * @requires vm.flavor == "server"
  * @library /test/lib
  * @run driver TestLoopMiningArguments
@@ -40,10 +40,11 @@ import jdk.test.lib.process.OutputAnalyzer;
 public class TestLoopMiningArguments {
 
     public static void testWith(String msg, boolean cls, int iters, String... args) throws Exception {
-        String[] cmds = Arrays.copyOf(args, args.length + 2);
-        cmds[args.length] = "-XX:+PrintFlagsFinal";
-        cmds[args.length + 1] = "-version";
-        ProcessBuilder pb = ProcessTools.createJavaProcessBuilder(cmds);
+        String[] cmds = Arrays.copyOf(args, args.length + 3);
+        cmds[args.length] = "-Xmx128m";
+        cmds[args.length + 1] = "-XX:+PrintFlagsFinal";
+        cmds[args.length + 2] = "-version";
+        ProcessBuilder pb = ProcessTools.createLimitedTestJavaProcessBuilder(cmds);
         OutputAnalyzer output = new OutputAnalyzer(pb.start());
         output.shouldHaveExitValue(0);
         output.shouldContain("UseCountedLoopSafepoints");
